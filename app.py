@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import math
+import os
 import re
+import shutil
+import tempfile
 import wave
 import zipfile
-import os
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import streamlit as st
 from openai import OpenAI
@@ -98,6 +101,24 @@ LANGUAGE_OPTIONS = [
     "LinkedIn (satirical)",
 ]
 
+DEFAULT_SETTINGS = {
+    "source_text": "",
+    "source_language": "English",
+    "target_language": "French",
+    "translation_model": "gpt-5-mini",
+    "tts_model": "gpt-4o-mini-tts",
+    "source_voice": "alloy",
+    "target_voice": "shimmer",
+    "speed": 1.0,
+    "output_format": "wav",
+    "source_first": True,
+    "target_duration_seconds": 30,
+    "min_segment_chars": 120,
+    "max_segment_chars": 800,
+    "source_instructions": "Speak clearly and naturally.",
+    "target_instructions": "Speak clearly and naturally.",
+}
+
 
 @dataclass
 class Segment:
@@ -120,7 +141,6 @@ class CostLine:
 
 
 def estimate_tokens_from_chars(text: str) -> int:
-    # Deliberately conservative rough estimate for planning UI.
     return max(1, math.ceil(len(text) / 4))
 
 
@@ -136,11 +156,6 @@ def normalize_whitespace(text: str) -> str:
 
 
 def sentence_split(text: str) -> List[str]:
-    """Split on likely sentence boundaries while keeping punctuation attached.
-
-    Regex is intentionally conservative (Latin-script uppercase lookahead) to avoid
-    over-splitting abbreviations, which is safer for downstream translation/TTS calls.
-    """
     chunks = re.split(r"(?<=[.!?;:])\s+(?=[A-ZÀ-ÖØ-ÝÄËÏÖÜÂÊÎÔÛÀÂÇÉÈÊËÎÏÔÙÛÜŸÆŒ0-9\"'])", text.strip())
     chunks = [c.strip() for c in chunks if c.strip()]
     if not chunks:
@@ -149,11 +164,6 @@ def sentence_split(text: str) -> List[str]:
 
 
 def split_long_unit(unit: str, max_chars: int) -> List[str]:
-    """Break oversized units so each API call stays under configured char limits.
-
-    Preference order: punctuation-aware split first, then whitespace fallback for very
-    long runs with little punctuation.
-    """
     if len(unit) <= max_chars:
         return [unit]
 
@@ -189,11 +199,6 @@ def split_long_unit(unit: str, max_chars: int) -> List[str]:
 
 
 def segment_text(text: str, target_chars: int, min_chars: int = 120, max_chars: int = 800) -> List[str]:
-    """Build near-uniform chunks for stable TTS duration and bounded API payloads.
-
-    `min_chars` reduces tiny segments (choppy audio), while `max_chars` caps segment
-    size to avoid overly large translation/TTS requests.
-    """
     text = normalize_whitespace(text)
     if not text:
         return []
@@ -227,6 +232,11 @@ def segment_text(text: str, target_chars: int, min_chars: int = 120, max_chars: 
     return segments
 
 
+@st.cache_data(ttl=3600, max_entries=64)
+def cached_segment_text(text: str, target_chars: int, min_chars: int, max_chars: int) -> List[str]:
+    return segment_text(text=text, target_chars=target_chars, min_chars=min_chars, max_chars=max_chars)
+
+
 def translate_segments(
     client: OpenAI,
     segments: List[Segment],
@@ -234,11 +244,6 @@ def translate_segments(
     target_language: str,
     model: str,
 ) -> List[Segment]:
-    """Translate one segment at a time to keep prompts simple and retry surface small.
-
-    Segment-level requests trade some global context for lower risk of hitting request
-    size limits and make failures easier to isolate.
-    """
     translated: List[Segment] = []
     for seg in segments:
         if target_language == "LinkedIn (satirical)":
@@ -276,8 +281,6 @@ def translate_segments(
 
 
 def write_wav_bytes(response) -> bytes:
-    # SDK returns binary content helper on audio endpoints.
-    # Try common helper methods first, then raw bytes fallback.
     if hasattr(response, "read"):
         return response.read()
     if hasattr(response, "content"):
@@ -310,11 +313,6 @@ def tts_segment(
 
 
 def concat_wav_bytes(parts: List[bytes]) -> bytes:
-    """Concatenate WAV chunks only when core PCM parameters are identical.
-
-    WAV frame data can be safely appended only if channels/sample width/sample rate/
-    compression type match across chunks.
-    """
     if not parts:
         return b""
 
@@ -325,7 +323,6 @@ def concat_wav_bytes(parts: List[bytes]) -> bytes:
             if params is None:
                 params = w.getparams()
             else:
-                # Guardrail: mismatched encodings would produce invalid or noisy output.
                 if (w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getcomptype()) != (
                     params.nchannels,
                     params.sampwidth,
@@ -349,26 +346,15 @@ def concat_wav_bytes(parts: List[bytes]) -> bytes:
 def build_alternating_wav(source_parts: List[bytes], translated_parts: List[bytes], source_first: bool = True) -> bytes:
     ordered: List[bytes] = []
     for s, t in zip(source_parts, translated_parts):
-        if source_first:
-            ordered.extend([s, t])
-        else:
-            ordered.extend([t, s])
+        ordered.extend([s, t] if source_first else [t, s])
     return concat_wav_bytes(ordered)
 
 
 def concat_mp3_bytes(parts: List[bytes]) -> bytes:
-    """Simple MP3 concatenation for same-encoder segment output."""
     return b"".join(parts)
 
 
 def estimate_tts_cost(model: str, text_a: str, text_b: str) -> float:
-    """Estimate TTS spend with coarse planning heuristics (not billing-accurate).
-
-    Assumptions:
-    - ~4 chars/token for text-token approximation.
-    - ~750 chars/minute speaking rate for duration approximation.
-    - For GPT-4o mini TTS audio tokens, use 1 token / 50ms from pricing guidance.
-    """
     total_text = text_a + text_b
     if model in {"tts-1", "tts-1-hd"}:
         per_mchar = float(TTS_MODELS[model]["per_mchar"])
@@ -376,8 +362,6 @@ def estimate_tts_cost(model: str, text_a: str, text_b: str) -> float:
 
     text_tokens = estimate_tokens_from_chars(total_text)
     est_minutes = estimate_minutes_from_chars(total_text)
-    # Official realtime cost guide states assistant audio messages use 1 audio token per 50ms.
-    # 60 sec / 0.05 sec = 1200 audio tokens per minute.
     audio_tokens = est_minutes * 1200
     text_input = (text_tokens / 1_000_000) * float(TTS_MODELS[model]["text_input_per_mtok"])
     audio_output = (audio_tokens / 1_000_000) * float(TTS_MODELS[model]["audio_output_per_mtok"])
@@ -393,7 +377,8 @@ def estimate_translation_cost(model: str, source_text: str, target_language_mult
     )
 
 
-def comparison_table(source_text: str, translated_multiplier: float = 1.1) -> List[CostLine]:
+@st.cache_data(ttl=3600, max_entries=128)
+def cached_comparison_table(source_text: str, translated_multiplier: float = 1.1) -> List[dict]:
     rows: List[CostLine] = []
     for t_model, t_meta in TRANSLATION_MODELS.items():
         for v_model, v_meta in TTS_MODELS.items():
@@ -411,7 +396,7 @@ def comparison_table(source_text: str, translated_multiplier: float = 1.1) -> Li
                 )
             )
     rows.sort(key=lambda r: r.estimated_total_cost)
-    return rows
+    return [asdict(r) for r in rows]
 
 
 def build_zip(artifacts: Dict[str, bytes], manifest: dict) -> bytes:
@@ -423,12 +408,66 @@ def build_zip(artifacts: Dict[str, bytes], manifest: dict) -> bytes:
     return out.getvalue()
 
 
+def make_fingerprint(payload: dict) -> str:
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def ensure_state() -> None:
+    if "settings" not in st.session_state:
+        st.session_state["settings"] = DEFAULT_SETTINGS.copy()
+    if "base_segments" not in st.session_state:
+        st.session_state["base_segments"] = []
+    if "prepared_fingerprint" not in st.session_state:
+        st.session_state["prepared_fingerprint"] = ""
+    if "translated_segments" not in st.session_state:
+        st.session_state["translated_segments"] = []
+    if "translation_fingerprint" not in st.session_state:
+        st.session_state["translation_fingerprint"] = ""
+    if "audio_generation_fingerprint" not in st.session_state:
+        st.session_state["audio_generation_fingerprint"] = ""
+    if "audio_status" not in st.session_state:
+        st.session_state["audio_status"] = {}
+    if "segment_audio_files" not in st.session_state:
+        st.session_state["segment_audio_files"] = {}
+    if "artifacts" not in st.session_state:
+        st.session_state["artifacts"] = {}
+    if "manifest" not in st.session_state:
+        st.session_state["manifest"] = {}
+    if "temp_audio_dir" not in st.session_state:
+        st.session_state["temp_audio_dir"] = ""
+    if "api_client" not in st.session_state:
+        st.session_state["api_client"] = None
+    if "api_key_fingerprint" not in st.session_state:
+        st.session_state["api_key_fingerprint"] = ""
+
+
+def clear_audio_tempdir() -> None:
+    old_dir = st.session_state.get("temp_audio_dir", "")
+    if old_dir and Path(old_dir).exists():
+        shutil.rmtree(old_dir, ignore_errors=True)
+    st.session_state["temp_audio_dir"] = ""
+    st.session_state["segment_audio_files"] = {}
+    st.session_state["audio_status"] = {}
+    st.session_state["artifacts"] = {}
+    st.session_state["manifest"] = {}
+    st.session_state["audio_generation_fingerprint"] = ""
+
+
+def get_api_client(api_key: str) -> OpenAI:
+    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    if st.session_state.get("api_client") is None or st.session_state.get("api_key_fingerprint") != key_hash:
+        st.session_state["api_client"] = OpenAI(api_key=api_key)
+        st.session_state["api_key_fingerprint"] = key_hash
+    return st.session_state["api_client"]
+
+
 def render_cost_panel(source_text: str, selected_translation_model: str, selected_tts_model: str) -> None:
     if not source_text.strip():
         st.info("Enter text to see estimated cost comparisons.")
         return
 
-    rows = comparison_table(source_text)
+    rows = cached_comparison_table(source_text)
     selected_total = estimate_translation_cost(selected_translation_model, source_text) + estimate_tts_cost(
         selected_tts_model,
         source_text,
@@ -444,306 +483,226 @@ def render_cost_panel(source_text: str, selected_translation_model: str, selecte
 
     table_data = [
         {
-            "Model pair": r.model,
-            "Translation": round(r.estimated_translation_cost, 4),
-            "TTS": round(r.estimated_tts_cost, 4),
-            "Total": round(r.estimated_total_cost, 4),
-            "Notes": r.notes,
+            "Model pair": r["model"],
+            "Translation": round(r["estimated_translation_cost"], 4),
+            "TTS": round(r["estimated_tts_cost"], 4),
+            "Total": round(r["estimated_total_cost"], 4),
+            "Notes": r["notes"],
         }
         for r in rows[:12]
     ]
     st.dataframe(table_data, use_container_width=True)
 
 
-def main() -> None:
-    st.set_page_config(page_title="Bilingual Text-to-Audio Composer", layout="wide")
-    st.title("Bilingual Text-to-Audio Composer")
-    st.write(
-        "Generate source-language audio, translated-language audio, and an alternating bilingual WAV file from raw text."
-    )
+def get_prepare_fingerprint(settings: dict, target_chars: int) -> str:
+    payload = {
+        "source_text": settings["source_text"],
+        "source_language": settings["source_language"],
+        "target_language": settings["target_language"],
+        "translation_model": settings["translation_model"],
+        "segment": {
+            "target_chars": target_chars,
+            "min_segment_chars": settings["min_segment_chars"],
+            "max_segment_chars": settings["max_segment_chars"],
+            "target_duration_seconds": settings["target_duration_seconds"],
+        },
+    }
+    return make_fingerprint(payload)
 
-    if "segments" not in st.session_state:
-        st.session_state["segments"] = []
-    if "artifacts" not in st.session_state:
-        st.session_state["artifacts"] = {}
-    if "manifest" not in st.session_state:
-        st.session_state["manifest"] = {}
 
-    configured_api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+def get_audio_fingerprint(settings: dict, prepare_fingerprint: str) -> str:
+    payload = {
+        "prepare_fingerprint": prepare_fingerprint,
+        "tts_model": settings["tts_model"],
+        "source_voice": settings["source_voice"],
+        "target_voice": settings["target_voice"],
+        "speed": settings["speed"],
+        "source_first": settings["source_first"],
+        "output_format": settings["output_format"],
+        "source_instructions": settings["source_instructions"],
+        "target_instructions": settings["target_instructions"],
+    }
+    return make_fingerprint(payload)
 
-    with st.sidebar:
-        st.header("OpenAI settings")
-        if configured_api_key:
-            st.success("Using OPENAI_API_KEY from secrets/environment.")
-            api_key = configured_api_key
-        else:
-            api_key = st.text_input("OpenAI API key", type="password", help="Used only for this session.")
-        translation_model = st.selectbox(
-            "Translation model",
-            options=list(TRANSLATION_MODELS.keys()),
-            format_func=lambda k: TRANSLATION_MODELS[k]["label"],
-        )
-        tts_model = st.selectbox(
-            "TTS model",
-            options=list(TTS_MODELS.keys()),
-            format_func=lambda k: TTS_MODELS[k]["label"],
-        )
-        source_voice = st.selectbox("Source voice", VOICE_OPTIONS, index=0)
-        target_voice = st.selectbox("Target voice", VOICE_OPTIONS, index=6)
-        st.markdown(
-            "Try and compare available voices on the official OpenAI voice page: "
-            "[openai.fm](https://www.openai.fm/)."
-        )
-        speed = st.slider("Speech speed", min_value=0.75, max_value=1.25, value=1.0, step=0.05)
-        output_format = st.selectbox("Audio output format", options=["wav", "mp3"], index=0)
-        source_first = st.toggle("Source language first in alternating file", value=True)
 
+def create_segments_from_texts(segment_texts: List[str]) -> List[Segment]:
+    return [Segment(idx=i + 1, source_text=s, source_chars=len(s)) for i, s in enumerate(segment_texts)]
+
+
+def load_segment_bytes(segment_audio_files: dict, segments: List[Segment], side: str) -> List[bytes]:
+    blobs: List[bytes] = []
+    for seg in segments:
+        file_path = segment_audio_files.get(seg.idx, {}).get(side)
+        if not file_path:
+            raise ValueError(f"Missing {side} audio file for segment {seg.idx}")
+        blobs.append(Path(file_path).read_bytes())
+    return blobs
+
+
+def render_prepare_tab(configured_api_key: str) -> None:
+    settings = st.session_state["settings"]
     left, right = st.columns([1.2, 1])
 
     with left:
-        source_text = st.text_area("Source text", height=340, placeholder="Paste text here...")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            source_language = st.selectbox("Source language", LANGUAGE_OPTIONS, index=0)
-        with c2:
-            target_language = st.selectbox("Target language", LANGUAGE_OPTIONS, index=1)
-        with c3:
-            target_duration_seconds = st.slider(
-                "Target segment duration (seconds)",
-                min_value=3,
-                max_value=60,
-                value=30,
-                step=1,
+        with st.form("main_controls_form"):
+            source_text = st.text_area("Source text", value=settings["source_text"], height=300, placeholder="Paste text here...")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                source_language = st.selectbox(
+                    "Source language", LANGUAGE_OPTIONS, index=LANGUAGE_OPTIONS.index(settings["source_language"])
+                )
+            with c2:
+                target_language = st.selectbox(
+                    "Target language", LANGUAGE_OPTIONS, index=LANGUAGE_OPTIONS.index(settings["target_language"])
+                )
+            with c3:
+                target_duration_seconds = st.slider(
+                    "Target segment duration (seconds)", min_value=3, max_value=60, value=settings["target_duration_seconds"], step=1
+                )
+
+            min_segment_chars = st.slider(
+                "Minimum segment characters", min_value=50, max_value=500, value=settings["min_segment_chars"], step=10
+            )
+            max_segment_chars = st.slider(
+                "Maximum segment characters", min_value=50, max_value=1200, value=settings["max_segment_chars"], step=20
             )
 
-        min_segment_chars = st.slider(
-            "Minimum segment characters",
-            min_value=50,
-            max_value=500,
-            value=120,
-            step=10,
-        )
-        max_segment_chars = st.slider(
-            "Maximum segment characters",
-            min_value=50,
-            max_value=1200,
-            value=800,
-            step=20,
-        )
+            st.divider()
+            st.caption("Generation controls")
+            translation_model = st.selectbox(
+                "Translation model",
+                options=list(TRANSLATION_MODELS.keys()),
+                index=list(TRANSLATION_MODELS.keys()).index(settings["translation_model"]),
+                format_func=lambda k: TRANSLATION_MODELS[k]["label"],
+            )
+            tts_model = st.selectbox(
+                "TTS model",
+                options=list(TTS_MODELS.keys()),
+                index=list(TTS_MODELS.keys()).index(settings["tts_model"]),
+                format_func=lambda k: TTS_MODELS[k]["label"],
+            )
+            source_voice = st.selectbox("Source voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["source_voice"]))
+            target_voice = st.selectbox("Target voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["target_voice"]))
+            speed = st.slider("Speech speed", min_value=0.75, max_value=1.25, value=settings["speed"], step=0.05)
+            output_format = st.selectbox("Audio output format", options=["wav", "mp3"], index=["wav", "mp3"].index(settings["output_format"]))
+            source_first = st.toggle("Source language first in alternating file", value=settings["source_first"])
 
-        if min_segment_chars > max_segment_chars:
-            st.warning("Minimum segment characters cannot exceed maximum. Using maximum value for both.")
-            min_segment_chars = max_segment_chars
+            source_instructions = st.text_input(
+                "Source voice instructions (only for GPT-4o mini TTS)", value=settings["source_instructions"]
+            )
+            target_instructions = st.text_input(
+                "Target voice instructions (only for GPT-4o mini TTS)", value=settings["target_instructions"]
+            )
+            submitted = st.form_submit_button("Apply settings & prepare", type="primary", use_container_width=True)
+
+        if submitted:
+            if min_segment_chars > max_segment_chars:
+                min_segment_chars = max_segment_chars
+                st.warning("Minimum segment characters cannot exceed maximum. Using maximum value for both.")
+
+            updated = {
+                "source_text": source_text,
+                "source_language": source_language,
+                "target_language": target_language,
+                "translation_model": translation_model,
+                "tts_model": tts_model,
+                "source_voice": source_voice,
+                "target_voice": target_voice,
+                "speed": speed,
+                "output_format": output_format,
+                "source_first": source_first,
+                "target_duration_seconds": target_duration_seconds,
+                "min_segment_chars": min_segment_chars,
+                "max_segment_chars": max_segment_chars,
+                "source_instructions": source_instructions,
+                "target_instructions": target_instructions,
+            }
+            chars_per_minute = 760
+            target_chars = round(updated["target_duration_seconds"] * chars_per_minute / 60)
+            target_chars = max(updated["min_segment_chars"], min(target_chars, updated["max_segment_chars"]))
+            prepare_fingerprint = get_prepare_fingerprint(updated, target_chars)
+
+            if prepare_fingerprint != st.session_state.get("prepared_fingerprint"):
+                clear_audio_tempdir()
+                st.session_state["translated_segments"] = []
+                st.session_state["translation_fingerprint"] = ""
+                segment_texts = cached_segment_text(
+                    text=updated["source_text"],
+                    target_chars=target_chars,
+                    min_chars=updated["min_segment_chars"],
+                    max_chars=updated["max_segment_chars"],
+                )
+                st.session_state["base_segments"] = create_segments_from_texts(segment_texts)
+                st.session_state["prepared_fingerprint"] = prepare_fingerprint
+                st.success("Prepared new segments from current settings.")
+            else:
+                st.info("Inputs unchanged. Reusing existing prepared segmentation.")
+            st.session_state["settings"] = updated
 
         chars_per_minute = 760
-        target_chars = round(target_duration_seconds * chars_per_minute / 60)
-        target_chars = max(min_segment_chars, min(target_chars, max_segment_chars))
+        target_chars = round(settings["target_duration_seconds"] * chars_per_minute / 60)
+        target_chars = max(settings["min_segment_chars"], min(target_chars, settings["max_segment_chars"]))
         st.caption(
             f"Computed target segment size: ~{target_chars} chars "
-            f"({target_duration_seconds}s at ~{chars_per_minute} chars/min)."
+            f"({settings['target_duration_seconds']}s at ~{chars_per_minute} chars/min)."
         )
 
-        source_instructions = st.text_input(
-            "Source voice instructions (only for GPT-4o mini TTS)",
-            value="Speak clearly and naturally.",
-        )
-        target_instructions = st.text_input(
-            "Target voice instructions (only for GPT-4o mini TTS)",
-            value="Speak clearly and naturally.",
-        )
+        if configured_api_key:
+            st.success("Using OPENAI_API_KEY from secrets/environment.")
 
-        preview_only = st.checkbox("Preview segmentation only", value=False)
-        resegment = st.button("Re-segment text", use_container_width=True)
-        generate = st.button("Generate bilingual audio", type="primary", use_container_width=True)
+        if settings["source_text"].strip() and st.session_state["base_segments"]:
+            segments_preview = st.session_state["base_segments"]
+            with st.expander(f"Segment preview ({len(segments_preview)} segments)", expanded=False):
+                for seg in segments_preview:
+                    st.markdown(f"**Segment {seg.idx}** ({seg.source_chars} chars)")
+                    st.write(seg.source_text)
 
     with right:
-        render_cost_panel(source_text, translation_model, tts_model)
+        render_cost_panel(settings["source_text"], settings["translation_model"], settings["tts_model"])
 
-    segmentation_settings = {
-        "source_text": source_text,
-        "target_chars": target_chars,
-        "min_segment_chars": min_segment_chars,
-        "max_segment_chars": max_segment_chars,
-    }
-    if "base_segments" not in st.session_state:
-        st.session_state["base_segments"] = []
-    if "last_segmentation_settings" not in st.session_state:
-        st.session_state["last_segmentation_settings"] = {}
 
-    settings_changed = st.session_state["last_segmentation_settings"] != segmentation_settings
-    if source_text.strip() and (resegment or settings_changed):
-        st.session_state["base_segments"] = [
-            Segment(idx=i + 1, source_text=s, source_chars=len(s))
-            for i, s in enumerate(
-                segment_text(
-                    source_text,
-                    target_chars=target_chars,
-                    min_chars=min_segment_chars,
-                    max_chars=max_segment_chars,
-                )
-            )
-        ]
-        st.session_state["last_segmentation_settings"] = segmentation_settings
+def render_translate_tab(api_key: str) -> None:
+    settings = st.session_state["settings"]
+    st.subheader("Translate")
 
-    if source_text.strip():
-        segments_preview = st.session_state["base_segments"]
-        with st.expander(f"Segment preview ({len(segments_preview)} segments)", expanded=False):
-            for seg in segments_preview:
-                st.markdown(f"**Segment {seg.idx}** ({seg.source_chars} chars)")
-                st.write(seg.source_text)
+    if not settings["source_text"].strip():
+        st.info("Go to Prepare and enter source text first.")
+        return
+    if not st.session_state["base_segments"]:
+        st.info("Go to Prepare and click 'Apply settings & prepare' to segment text.")
+        return
+    if settings["source_language"] == settings["target_language"]:
+        st.error("Choose two different languages in Prepare.")
+        return
+    if not api_key.strip():
+        st.error("Set OPENAI_API_KEY in Streamlit secrets/environment or enter it in the sidebar.")
+        return
 
-    if generate:
-        if not api_key.strip():
-            st.error("Set OPENAI_API_KEY in Streamlit secrets (recommended) or enter it in the sidebar.")
-            return
-        if not source_text.strip():
-            st.error("Enter source text.")
-            return
-        if source_language == target_language:
-            st.error("Choose two different languages.")
-            return
-
-        client = OpenAI(api_key=api_key.strip())
-        if settings_changed:
-            st.info("Segmentation settings changed since the last segmentation. Re-segmenting now.")
-            st.session_state["base_segments"] = [
-                Segment(idx=i + 1, source_text=s, source_chars=len(s))
-                for i, s in enumerate(
-                    segment_text(
-                        source_text,
-                        target_chars=target_chars,
-                        min_chars=min_segment_chars,
-                        max_chars=max_segment_chars,
-                    )
-                )
-            ]
-            st.session_state["last_segmentation_settings"] = segmentation_settings
-        base_segments = st.session_state["base_segments"]
-
-        if not base_segments:
-            st.error("No segments were produced from the input text.")
-            return
-
-        st.session_state["segments"] = []
-        st.session_state["artifacts"] = {}
-        st.session_state["manifest"] = {}
-
-        try:
-            with st.status("Running pipeline", expanded=True) as status:
-                st.write(f"Segmented input into {len(base_segments)} chunks.")
-                translated_segments = translate_segments(
-                    client=client,
-                    segments=base_segments,
-                    source_language=source_language,
-                    target_language=target_language,
-                    model=translation_model,
-                )
-                st.write("Translation complete.")
-
-                if preview_only:
-                    st.session_state["segments"] = translated_segments
-                    status.update(label="Preview complete", state="complete")
-                    st.success("Preview ready. Audio generation was skipped.")
-                    return
-
-                source_audio_parts: List[bytes] = []
-                target_audio_parts: List[bytes] = []
-                artifacts: Dict[str, bytes] = {}
-
-                progress = st.progress(0.0)
-                total_steps = len(translated_segments) * 2
-                completed = 0
-
-                for seg in translated_segments:
-                    source_audio = tts_segment(
+    if st.button("Run translation", type="primary", use_container_width=True):
+        translation_fp = st.session_state["prepared_fingerprint"]
+        if st.session_state.get("translation_fingerprint") == translation_fp and st.session_state.get("translated_segments"):
+            st.info("Translation already exists for these inputs. Reusing previous result.")
+        else:
+            try:
+                client = get_api_client(api_key.strip())
+                with st.status("Translating segments", expanded=True) as status:
+                    translated = translate_segments(
                         client=client,
-                        text=seg.source_text,
-                        model=tts_model,
-                        voice=source_voice,
-                        instructions=source_instructions,
-                        speed=speed,
-                        response_format=output_format,
+                        segments=st.session_state["base_segments"],
+                        source_language=settings["source_language"],
+                        target_language=settings["target_language"],
+                        model=settings["translation_model"],
                     )
-                    source_name = f"segments/source_{seg.idx:03d}.{output_format}"
-                    artifacts[source_name] = source_audio
-                    source_audio_parts.append(source_audio)
-                    seg.source_audio_filename = source_name
-                    completed += 1
-                    progress.progress(completed / total_steps)
+                    st.session_state["translated_segments"] = translated
+                    st.session_state["translation_fingerprint"] = translation_fp
+                    clear_audio_tempdir()
+                    status.update(label="Translation complete", state="complete")
+            except Exception as exc:
+                st.exception(exc)
 
-                    target_audio = tts_segment(
-                        client=client,
-                        text=seg.translated_text,
-                        model=tts_model,
-                        voice=target_voice,
-                        instructions=target_instructions,
-                        speed=speed,
-                        response_format=output_format,
-                    )
-                    target_name = f"segments/target_{seg.idx:03d}.{output_format}"
-                    artifacts[target_name] = target_audio
-                    target_audio_parts.append(target_audio)
-                    seg.translated_audio_filename = target_name
-                    completed += 1
-                    progress.progress(completed / total_steps)
-
-                if output_format == "wav":
-                    full_source = concat_wav_bytes(source_audio_parts)
-                    full_target = concat_wav_bytes(target_audio_parts)
-                    alternating = build_alternating_wav(source_audio_parts, target_audio_parts, source_first=source_first)
-                else:
-                    full_source = concat_mp3_bytes(source_audio_parts)
-                    full_target = concat_mp3_bytes(target_audio_parts)
-                    ordered_mp3: List[bytes] = []
-                    for s, t in zip(source_audio_parts, target_audio_parts):
-                        ordered_mp3.extend([s, t] if source_first else [t, s])
-                    alternating = concat_mp3_bytes(ordered_mp3)
-
-                artifacts[f"full_source.{output_format}"] = full_source
-                artifacts[f"full_target.{output_format}"] = full_target
-                artifacts[f"alternating_bilingual.{output_format}"] = alternating
-
-                # Manifest captures reproducibility details so a ZIP can be inspected or
-                # regenerated later without relying on UI state.
-                manifest = {
-                    "pipeline": "text_only_bilingual_recomposer",
-                    "source_language": source_language,
-                    "target_language": target_language,
-                    "translation_model": translation_model,
-                    "tts_model": tts_model,
-                    "source_voice": source_voice,
-                    "target_voice": target_voice,
-                    "speed": speed,
-                    "source_first": source_first,
-                    "output_format": output_format,
-                    "segmentation_settings": {
-                        "target_duration_seconds": target_duration_seconds,
-                        "chars_per_minute": chars_per_minute,
-                        "target_chars": target_chars,
-                        "min_segment_chars": min_segment_chars,
-                        "max_segment_chars": max_segment_chars,
-                    },
-                    "segments": [asdict(s) for s in translated_segments],
-                    "estimated_cost_usd": {
-                        # Cost values are pre-flight estimates based on heuristics above.
-                        "translation": round(estimate_translation_cost(translation_model, source_text), 6),
-                        "tts": round(estimate_tts_cost(tts_model, source_text, " ".join(s.translated_text for s in translated_segments)), 6),
-                    },
-                }
-                manifest["estimated_cost_usd"]["total"] = round(
-                    manifest["estimated_cost_usd"]["translation"] + manifest["estimated_cost_usd"]["tts"], 6
-                )
-
-                st.session_state["segments"] = translated_segments
-                st.session_state["artifacts"] = artifacts
-                st.session_state["manifest"] = manifest
-                status.update(label="Generation complete", state="complete")
-        except Exception as exc:
-            st.exception(exc)
-            return
-
-    if st.session_state.get("segments"):
-        st.subheader("Generated segment map")
+    translated_segments = st.session_state.get("translated_segments", [])
+    if translated_segments:
+        st.success(f"Translated {len(translated_segments)} segments.")
         st.dataframe(
             [
                 {
@@ -753,42 +712,271 @@ def main() -> None:
                     "Source text": seg.source_text,
                     "Translated text": seg.translated_text,
                 }
-                for seg in st.session_state["segments"]
+                for seg in translated_segments
             ],
             use_container_width=True,
         )
 
+
+def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
+    settings = st.session_state["settings"]
+    translated_segments = st.session_state.get("translated_segments", [])
+    if not translated_segments:
+        st.error("Run translation first.")
+        return
+
+    audio_fp = get_audio_fingerprint(settings, st.session_state["prepared_fingerprint"])
+    if not st.session_state.get("temp_audio_dir"):
+        st.session_state["temp_audio_dir"] = tempfile.mkdtemp(prefix="bilingual_audio_")
+
+    segment_map = {seg.idx: seg for seg in translated_segments}
+    client = get_api_client(api_key.strip())
+    progress = st.progress(0.0)
+
+    with st.status("Generating audio", expanded=True) as status:
+        total_steps = len(indices) * 2
+        completed = 0
+        for seg_idx in indices:
+            seg = segment_map[seg_idx]
+            seg_files = st.session_state["segment_audio_files"].setdefault(seg_idx, {})
+            seg_status = st.session_state["audio_status"].setdefault(seg_idx, {"source": False, "target": False, "error": ""})
+            try:
+                source_blob = tts_segment(
+                    client=client,
+                    text=seg.source_text,
+                    model=settings["tts_model"],
+                    voice=settings["source_voice"],
+                    instructions=settings["source_instructions"],
+                    speed=settings["speed"],
+                    response_format=settings["output_format"],
+                )
+                source_path = Path(st.session_state["temp_audio_dir"]) / f"source_{seg.idx:03d}.{settings['output_format']}"
+                source_path.write_bytes(source_blob)
+                seg_files["source"] = str(source_path)
+                seg.source_audio_filename = f"segments/source_{seg.idx:03d}.{settings['output_format']}"
+                seg_status["source"] = True
+                completed += 1
+                progress.progress(completed / total_steps)
+
+                target_blob = tts_segment(
+                    client=client,
+                    text=seg.translated_text,
+                    model=settings["tts_model"],
+                    voice=settings["target_voice"],
+                    instructions=settings["target_instructions"],
+                    speed=settings["speed"],
+                    response_format=settings["output_format"],
+                )
+                target_path = Path(st.session_state["temp_audio_dir"]) / f"target_{seg.idx:03d}.{settings['output_format']}"
+                target_path.write_bytes(target_blob)
+                seg_files["target"] = str(target_path)
+                seg.translated_audio_filename = f"segments/target_{seg.idx:03d}.{settings['output_format']}"
+                seg_status["target"] = True
+                seg_status["error"] = ""
+                completed += 1
+                progress.progress(completed / total_steps)
+            except Exception as exc:
+                seg_status["error"] = str(exc)
+                st.error(f"Segment {seg_idx} failed: {exc}")
+                completed += 2
+                progress.progress(completed / total_steps)
+
+        status.update(label="Audio generation run complete", state="complete")
+
+    st.session_state["translated_segments"] = translated_segments
+
+    all_done = True
+    for seg in translated_segments:
+        seg_status = st.session_state["audio_status"].get(seg.idx, {})
+        if not (seg_status.get("source") and seg_status.get("target")):
+            all_done = False
+            break
+
+    if not all_done:
+        st.warning("Some segments failed. Review failures below and retry failed segments.")
+        return
+
+    segment_audio_files = st.session_state["segment_audio_files"]
+    source_parts = load_segment_bytes(segment_audio_files, translated_segments, "source")
+    target_parts = load_segment_bytes(segment_audio_files, translated_segments, "target")
+
+    if settings["output_format"] == "wav":
+        full_source = concat_wav_bytes(source_parts)
+        full_target = concat_wav_bytes(target_parts)
+        alternating = build_alternating_wav(source_parts, target_parts, source_first=settings["source_first"])
+    else:
+        full_source = concat_mp3_bytes(source_parts)
+        full_target = concat_mp3_bytes(target_parts)
+        ordered_mp3: List[bytes] = []
+        for s, t in zip(source_parts, target_parts):
+            ordered_mp3.extend([s, t] if settings["source_first"] else [t, s])
+        alternating = concat_mp3_bytes(ordered_mp3)
+
+    artifacts: Dict[str, bytes] = {
+        f"full_source.{settings['output_format']}": full_source,
+        f"full_target.{settings['output_format']}": full_target,
+        f"alternating_bilingual.{settings['output_format']}": alternating,
+    }
+
+    for seg in translated_segments:
+        source_path = st.session_state["segment_audio_files"][seg.idx]["source"]
+        target_path = st.session_state["segment_audio_files"][seg.idx]["target"]
+        artifacts[seg.source_audio_filename] = Path(source_path).read_bytes()
+        artifacts[seg.translated_audio_filename] = Path(target_path).read_bytes()
+
+    manifest = {
+        "pipeline": "text_only_bilingual_recomposer",
+        "source_language": settings["source_language"],
+        "target_language": settings["target_language"],
+        "translation_model": settings["translation_model"],
+        "tts_model": settings["tts_model"],
+        "source_voice": settings["source_voice"],
+        "target_voice": settings["target_voice"],
+        "speed": settings["speed"],
+        "source_first": settings["source_first"],
+        "output_format": settings["output_format"],
+        "segmentation_settings": {
+            "target_duration_seconds": settings["target_duration_seconds"],
+            "chars_per_minute": 760,
+            "target_chars": round(settings["target_duration_seconds"] * 760 / 60),
+            "min_segment_chars": settings["min_segment_chars"],
+            "max_segment_chars": settings["max_segment_chars"],
+        },
+        "segments": [asdict(s) for s in translated_segments],
+        "estimated_cost_usd": {
+            "translation": round(estimate_translation_cost(settings["translation_model"], settings["source_text"]), 6),
+            "tts": round(
+                estimate_tts_cost(
+                    settings["tts_model"],
+                    settings["source_text"],
+                    " ".join(s.translated_text for s in translated_segments),
+                ),
+                6,
+            ),
+        },
+    }
+    manifest["estimated_cost_usd"]["total"] = round(
+        manifest["estimated_cost_usd"]["translation"] + manifest["estimated_cost_usd"]["tts"], 6
+    )
+
+    st.session_state["artifacts"] = artifacts
+    st.session_state["manifest"] = manifest
+    st.session_state["audio_generation_fingerprint"] = audio_fp
+    st.success("Audio artifacts ready for export.")
+
+
+def render_audio_tab(api_key: str) -> None:
+    settings = st.session_state["settings"]
+    st.subheader("Generate Audio")
+
+    if not st.session_state.get("translated_segments"):
+        st.info("Run translation first.")
+        return
+
+    if not api_key.strip():
+        st.error("Set OPENAI_API_KEY in Streamlit secrets/environment or enter it in the sidebar.")
+        return
+
+    current_audio_fp = get_audio_fingerprint(settings, st.session_state["prepared_fingerprint"])
+    if st.session_state.get("audio_generation_fingerprint") == current_audio_fp and st.session_state.get("artifacts"):
+        st.info("Audio already matches current inputs. Reusing existing artifacts.")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("Generate / refresh all audio", type="primary", use_container_width=True):
+            clear_audio_tempdir()
+            indices = [seg.idx for seg in st.session_state["translated_segments"]]
+            generate_audio_for_indices(api_key=api_key, indices=indices)
+    with col_b:
+        failed_indices = [
+            idx for idx, status in st.session_state.get("audio_status", {}).items() if status.get("error") or not (status.get("source") and status.get("target"))
+        ]
+        if st.button("Retry failed segments", use_container_width=True, disabled=not failed_indices):
+            generate_audio_for_indices(api_key=api_key, indices=sorted(failed_indices))
+
+    translated_segments = st.session_state["translated_segments"]
+    status_rows = []
+    for seg in translated_segments:
+        status = st.session_state.get("audio_status", {}).get(seg.idx, {})
+        status_rows.append(
+            {
+                "#": seg.idx,
+                "Source audio": "✅" if status.get("source") else "—",
+                "Target audio": "✅" if status.get("target") else "—",
+                "Error": status.get("error", ""),
+            }
+        )
+    st.dataframe(status_rows, use_container_width=True)
+
+
+def render_export_tab() -> None:
     artifacts = st.session_state.get("artifacts", {})
     manifest = st.session_state.get("manifest", {})
-    if artifacts:
-        st.subheader("Downloads")
-        full_keys = [
-            f"alternating_bilingual.{manifest.get('output_format', 'wav')}",
-            f"full_source.{manifest.get('output_format', 'wav')}",
-            f"full_target.{manifest.get('output_format', 'wav')}",
-        ]
-        mime_type = "audio/wav" if manifest.get("output_format", "wav") == "wav" else "audio/mpeg"
-        audio_format = "audio/wav" if manifest.get("output_format", "wav") == "wav" else "audio/mp3"
-        for key in full_keys:
-            if key in artifacts:
-                st.download_button(
-                    label=f"Download {key}",
-                    data=artifacts[key],
-                    file_name=key,
-                    mime=mime_type,
-                )
-                st.audio(artifacts[key], format=audio_format)
+    st.subheader("Export")
 
-        zip_blob = build_zip(artifacts, manifest)
-        st.download_button(
-            label="Download full ZIP package",
-            data=zip_blob,
-            file_name="bilingual_audio_package.zip",
-            mime="application/zip",
+    if not artifacts:
+        st.info("Generate audio first, then downloads will appear here.")
+        return
+
+    full_keys = [
+        f"alternating_bilingual.{manifest.get('output_format', 'wav')}",
+        f"full_source.{manifest.get('output_format', 'wav')}",
+        f"full_target.{manifest.get('output_format', 'wav')}",
+    ]
+    mime_type = "audio/wav" if manifest.get("output_format", "wav") == "wav" else "audio/mpeg"
+    audio_format = "audio/wav" if manifest.get("output_format", "wav") == "wav" else "audio/mp3"
+
+    for key in full_keys:
+        if key in artifacts:
+            st.download_button(
+                label=f"Download {key}",
+                data=artifacts[key],
+                file_name=key,
+                mime=mime_type,
+            )
+            st.audio(artifacts[key], format=audio_format)
+
+    zip_blob = build_zip(artifacts, manifest)
+    st.download_button(
+        label="Download full ZIP package",
+        data=zip_blob,
+        file_name="bilingual_audio_package.zip",
+        mime="application/zip",
+    )
+
+    st.subheader("Manifest")
+    st.json(manifest)
+
+
+def main() -> None:
+    st.set_page_config(page_title="Bilingual Text-to-Audio Composer", layout="wide")
+    st.title("Bilingual Text-to-Audio Composer")
+    st.write("Generate source-language audio, translated-language audio, and an alternating bilingual WAV file from raw text.")
+
+    ensure_state()
+
+    configured_api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+    with st.sidebar:
+        st.header("OpenAI settings")
+        if configured_api_key:
+            api_key = configured_api_key
+        else:
+            api_key = st.text_input("OpenAI API key", type="password", help="Used only for this session.")
+        st.markdown(
+            "Try and compare available voices on the official OpenAI voice page: "
+            "[openai.fm](https://www.openai.fm/)."
         )
 
-        st.subheader("Manifest")
-        st.json(manifest)
+    tab_prepare, tab_translate, tab_audio, tab_export = st.tabs(["Prepare", "Translate", "Generate Audio", "Export"])
+
+    with tab_prepare:
+        render_prepare_tab(configured_api_key=configured_api_key)
+    with tab_translate:
+        render_translate_tab(api_key=api_key)
+    with tab_audio:
+        render_audio_tab(api_key=api_key)
+    with tab_export:
+        render_export_tab()
 
 
 if __name__ == "__main__":
