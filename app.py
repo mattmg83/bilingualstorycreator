@@ -135,6 +135,11 @@ def normalize_whitespace(text: str) -> str:
 
 
 def sentence_split(text: str) -> List[str]:
+    """Split on likely sentence boundaries while keeping punctuation attached.
+
+    Regex is intentionally conservative (Latin-script uppercase lookahead) to avoid
+    over-splitting abbreviations, which is safer for downstream translation/TTS calls.
+    """
     chunks = re.split(r"(?<=[.!?;:])\s+(?=[A-ZÀ-ÖØ-ÝÄËÏÖÜÂÊÎÔÛÀÂÇÉÈÊËÎÏÔÙÛÜŸÆŒ0-9\"'])", text.strip())
     chunks = [c.strip() for c in chunks if c.strip()]
     if not chunks:
@@ -143,6 +148,11 @@ def sentence_split(text: str) -> List[str]:
 
 
 def split_long_unit(unit: str, max_chars: int) -> List[str]:
+    """Break oversized units so each API call stays under configured char limits.
+
+    Preference order: punctuation-aware split first, then whitespace fallback for very
+    long runs with little punctuation.
+    """
     if len(unit) <= max_chars:
         return [unit]
 
@@ -178,6 +188,11 @@ def split_long_unit(unit: str, max_chars: int) -> List[str]:
 
 
 def segment_text(text: str, target_chars: int, min_chars: int = 120, max_chars: int = 800) -> List[str]:
+    """Build near-uniform chunks for stable TTS duration and bounded API payloads.
+
+    `min_chars` reduces tiny segments (choppy audio), while `max_chars` caps segment
+    size to avoid overly large translation/TTS requests.
+    """
     text = normalize_whitespace(text)
     if not text:
         return []
@@ -218,6 +233,11 @@ def translate_segments(
     target_language: str,
     model: str,
 ) -> List[Segment]:
+    """Translate one segment at a time to keep prompts simple and retry surface small.
+
+    Segment-level requests trade some global context for lower risk of hitting request
+    size limits and make failures easier to isolate.
+    """
     translated: List[Segment] = []
     for seg in segments:
         prompt = (
@@ -273,6 +293,11 @@ def tts_segment(
 
 
 def concat_wav_bytes(parts: List[bytes]) -> bytes:
+    """Concatenate WAV chunks only when core PCM parameters are identical.
+
+    WAV frame data can be safely appended only if channels/sample width/sample rate/
+    compression type match across chunks.
+    """
     if not parts:
         return b""
 
@@ -283,6 +308,7 @@ def concat_wav_bytes(parts: List[bytes]) -> bytes:
             if params is None:
                 params = w.getparams()
             else:
+                # Guardrail: mismatched encodings would produce invalid or noisy output.
                 if (w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getcomptype()) != (
                     params.nchannels,
                     params.sampwidth,
@@ -314,6 +340,13 @@ def build_alternating_wav(source_parts: List[bytes], translated_parts: List[byte
 
 
 def estimate_tts_cost(model: str, text_a: str, text_b: str) -> float:
+    """Estimate TTS spend with coarse planning heuristics (not billing-accurate).
+
+    Assumptions:
+    - ~4 chars/token for text-token approximation.
+    - ~750 chars/minute speaking rate for duration approximation.
+    - For GPT-4o mini TTS audio tokens, use 1 token / 50ms from pricing guidance.
+    """
     total_text = text_a + text_b
     if model in {"tts-1", "tts-1-hd"}:
         per_mchar = float(TTS_MODELS[model]["per_mchar"])
@@ -612,6 +645,8 @@ def main() -> None:
                 artifacts["full_target.wav"] = full_target
                 artifacts["alternating_bilingual.wav"] = alternating
 
+                # Manifest captures reproducibility details so a ZIP can be inspected or
+                # regenerated later without relying on UI state.
                 manifest = {
                     "pipeline": "text_only_bilingual_recomposer",
                     "source_language": source_language,
@@ -631,6 +666,7 @@ def main() -> None:
                     },
                     "segments": [asdict(s) for s in translated_segments],
                     "estimated_cost_usd": {
+                        # Cost values are pre-flight estimates based on heuristics above.
                         "translation": round(estimate_translation_cost(translation_model, source_text), 6),
                         "tts": round(estimate_tts_cost(tts_model, source_text, " ".join(s.translated_text for s in translated_segments)), 6),
                     },
