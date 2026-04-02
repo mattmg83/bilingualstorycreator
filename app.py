@@ -95,6 +95,7 @@ LANGUAGE_OPTIONS = [
     "Japanese",
     "Korean",
     "Chinese",
+    "LinkedIn (satirical)",
 ]
 
 
@@ -240,11 +241,26 @@ def translate_segments(
     """
     translated: List[Segment] = []
     for seg in segments:
-        prompt = (
-            f"Translate the following text from {source_language} to {target_language}. "
-            "Preserve meaning and tone, keep it natural, and return only the translated text.\n\n"
-            f"Text:\n{seg.source_text}"
-        )
+        if target_language == "LinkedIn (satirical)":
+            prompt = (
+                "Rewrite the following text as a funny, satirical LinkedIn thought-leadership post. "
+                "Keep it readable and concise, sprinkle in classic LinkedIn clichés and humble-brag energy, "
+                f"and preserve the original meaning as much as possible. Source language: {source_language}. "
+                "Return only the rewritten text.\n\n"
+                f"Text:\n{seg.source_text}"
+            )
+        elif source_language == "LinkedIn (satirical)":
+            prompt = (
+                f"Translate the following text from satirical LinkedIn thought-leadership style into {target_language}. "
+                "Remove cliché corporate tone while preserving the core meaning. Return only the translated text.\n\n"
+                f"Text:\n{seg.source_text}"
+            )
+        else:
+            prompt = (
+                f"Translate the following text from {source_language} to {target_language}. "
+                "Preserve meaning and tone, keep it natural, and return only the translated text.\n\n"
+                f"Text:\n{seg.source_text}"
+            )
         response = client.responses.create(model=model, input=prompt)
         text = response.output_text.strip()
         translated.append(
@@ -278,12 +294,13 @@ def tts_segment(
     voice: str,
     instructions: str,
     speed: float,
+    response_format: str,
 ) -> bytes:
     kwargs = {
         "model": model,
         "voice": voice,
         "input": text,
-        "response_format": "wav",
+        "response_format": response_format,
         "speed": speed,
     }
     if TTS_MODELS[model].get("supports_instructions") and instructions.strip():
@@ -337,6 +354,11 @@ def build_alternating_wav(source_parts: List[bytes], translated_parts: List[byte
         else:
             ordered.extend([t, s])
     return concat_wav_bytes(ordered)
+
+
+def concat_mp3_bytes(parts: List[bytes]) -> bytes:
+    """Simple MP3 concatenation for same-encoder segment output."""
+    return b"".join(parts)
 
 
 def estimate_tts_cost(model: str, text_a: str, text_b: str) -> float:
@@ -468,7 +490,12 @@ def main() -> None:
         )
         source_voice = st.selectbox("Source voice", VOICE_OPTIONS, index=0)
         target_voice = st.selectbox("Target voice", VOICE_OPTIONS, index=6)
+        st.markdown(
+            "Try and compare available voices on the official OpenAI voice page: "
+            "[openai.fm](https://www.openai.fm/)."
+        )
         speed = st.slider("Speech speed", min_value=0.75, max_value=1.25, value=1.0, step=0.05)
+        output_format = st.selectbox("Audio output format", options=["wav", "mp3"], index=0)
         source_first = st.toggle("Source language first in alternating file", value=True)
 
     left, right = st.columns([1.2, 1])
@@ -483,7 +510,7 @@ def main() -> None:
         with c3:
             target_duration_seconds = st.slider(
                 "Target segment duration (seconds)",
-                min_value=8,
+                min_value=3,
                 max_value=60,
                 value=30,
                 step=1,
@@ -491,14 +518,14 @@ def main() -> None:
 
         min_segment_chars = st.slider(
             "Minimum segment characters",
-            min_value=60,
+            min_value=50,
             max_value=500,
             value=120,
             step=10,
         )
         max_segment_chars = st.slider(
             "Maximum segment characters",
-            min_value=200,
+            min_value=50,
             max_value=1200,
             value=800,
             step=20,
@@ -526,13 +553,26 @@ def main() -> None:
         )
 
         preview_only = st.checkbox("Preview segmentation only", value=False)
+        resegment = st.button("Re-segment text", use_container_width=True)
         generate = st.button("Generate bilingual audio", type="primary", use_container_width=True)
 
     with right:
         render_cost_panel(source_text, translation_model, tts_model)
 
-    if source_text.strip():
-        segments_preview = [
+    segmentation_settings = {
+        "source_text": source_text,
+        "target_chars": target_chars,
+        "min_segment_chars": min_segment_chars,
+        "max_segment_chars": max_segment_chars,
+    }
+    if "base_segments" not in st.session_state:
+        st.session_state["base_segments"] = []
+    if "last_segmentation_settings" not in st.session_state:
+        st.session_state["last_segmentation_settings"] = {}
+
+    settings_changed = st.session_state["last_segmentation_settings"] != segmentation_settings
+    if source_text.strip() and (resegment or settings_changed):
+        st.session_state["base_segments"] = [
             Segment(idx=i + 1, source_text=s, source_chars=len(s))
             for i, s in enumerate(
                 segment_text(
@@ -543,6 +583,10 @@ def main() -> None:
                 )
             )
         ]
+        st.session_state["last_segmentation_settings"] = segmentation_settings
+
+    if source_text.strip():
+        segments_preview = st.session_state["base_segments"]
         with st.expander(f"Segment preview ({len(segments_preview)} segments)", expanded=False):
             for seg in segments_preview:
                 st.markdown(f"**Segment {seg.idx}** ({seg.source_chars} chars)")
@@ -560,17 +604,21 @@ def main() -> None:
             return
 
         client = OpenAI(api_key=api_key.strip())
-        base_segments = [
-            Segment(idx=i + 1, source_text=s, source_chars=len(s))
-            for i, s in enumerate(
-                segment_text(
-                    source_text,
-                    target_chars=target_chars,
-                    min_chars=min_segment_chars,
-                    max_chars=max_segment_chars,
+        if settings_changed:
+            st.info("Segmentation settings changed since the last segmentation. Re-segmenting now.")
+            st.session_state["base_segments"] = [
+                Segment(idx=i + 1, source_text=s, source_chars=len(s))
+                for i, s in enumerate(
+                    segment_text(
+                        source_text,
+                        target_chars=target_chars,
+                        min_chars=min_segment_chars,
+                        max_chars=max_segment_chars,
+                    )
                 )
-            )
-        ]
+            ]
+            st.session_state["last_segmentation_settings"] = segmentation_settings
+        base_segments = st.session_state["base_segments"]
 
         if not base_segments:
             st.error("No segments were produced from the input text.")
@@ -607,43 +655,53 @@ def main() -> None:
                 completed = 0
 
                 for seg in translated_segments:
-                    source_wav = tts_segment(
+                    source_audio = tts_segment(
                         client=client,
                         text=seg.source_text,
                         model=tts_model,
                         voice=source_voice,
                         instructions=source_instructions,
                         speed=speed,
+                        response_format=output_format,
                     )
-                    source_name = f"segments/source_{seg.idx:03d}.wav"
-                    artifacts[source_name] = source_wav
-                    source_audio_parts.append(source_wav)
+                    source_name = f"segments/source_{seg.idx:03d}.{output_format}"
+                    artifacts[source_name] = source_audio
+                    source_audio_parts.append(source_audio)
                     seg.source_audio_filename = source_name
                     completed += 1
                     progress.progress(completed / total_steps)
 
-                    target_wav = tts_segment(
+                    target_audio = tts_segment(
                         client=client,
                         text=seg.translated_text,
                         model=tts_model,
                         voice=target_voice,
                         instructions=target_instructions,
                         speed=speed,
+                        response_format=output_format,
                     )
-                    target_name = f"segments/target_{seg.idx:03d}.wav"
-                    artifacts[target_name] = target_wav
-                    target_audio_parts.append(target_wav)
+                    target_name = f"segments/target_{seg.idx:03d}.{output_format}"
+                    artifacts[target_name] = target_audio
+                    target_audio_parts.append(target_audio)
                     seg.translated_audio_filename = target_name
                     completed += 1
                     progress.progress(completed / total_steps)
 
-                full_source = concat_wav_bytes(source_audio_parts)
-                full_target = concat_wav_bytes(target_audio_parts)
-                alternating = build_alternating_wav(source_audio_parts, target_audio_parts, source_first=source_first)
+                if output_format == "wav":
+                    full_source = concat_wav_bytes(source_audio_parts)
+                    full_target = concat_wav_bytes(target_audio_parts)
+                    alternating = build_alternating_wav(source_audio_parts, target_audio_parts, source_first=source_first)
+                else:
+                    full_source = concat_mp3_bytes(source_audio_parts)
+                    full_target = concat_mp3_bytes(target_audio_parts)
+                    ordered_mp3: List[bytes] = []
+                    for s, t in zip(source_audio_parts, target_audio_parts):
+                        ordered_mp3.extend([s, t] if source_first else [t, s])
+                    alternating = concat_mp3_bytes(ordered_mp3)
 
-                artifacts["full_source.wav"] = full_source
-                artifacts["full_target.wav"] = full_target
-                artifacts["alternating_bilingual.wav"] = alternating
+                artifacts[f"full_source.{output_format}"] = full_source
+                artifacts[f"full_target.{output_format}"] = full_target
+                artifacts[f"alternating_bilingual.{output_format}"] = alternating
 
                 # Manifest captures reproducibility details so a ZIP can be inspected or
                 # regenerated later without relying on UI state.
@@ -657,6 +715,7 @@ def main() -> None:
                     "target_voice": target_voice,
                     "speed": speed,
                     "source_first": source_first,
+                    "output_format": output_format,
                     "segmentation_settings": {
                         "target_duration_seconds": target_duration_seconds,
                         "chars_per_minute": chars_per_minute,
@@ -703,15 +762,22 @@ def main() -> None:
     manifest = st.session_state.get("manifest", {})
     if artifacts:
         st.subheader("Downloads")
-        for key in ["alternating_bilingual.wav", "full_source.wav", "full_target.wav"]:
+        full_keys = [
+            f"alternating_bilingual.{manifest.get('output_format', 'wav')}",
+            f"full_source.{manifest.get('output_format', 'wav')}",
+            f"full_target.{manifest.get('output_format', 'wav')}",
+        ]
+        mime_type = "audio/wav" if manifest.get("output_format", "wav") == "wav" else "audio/mpeg"
+        audio_format = "audio/wav" if manifest.get("output_format", "wav") == "wav" else "audio/mp3"
+        for key in full_keys:
             if key in artifacts:
                 st.download_button(
                     label=f"Download {key}",
                     data=artifacts[key],
                     file_name=key,
-                    mime="audio/wav",
+                    mime=mime_type,
                 )
-                st.audio(artifacts[key], format="audio/wav")
+                st.audio(artifacts[key], format=audio_format)
 
         zip_blob = build_zip(artifacts, manifest)
         st.download_button(
