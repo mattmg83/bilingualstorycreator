@@ -448,10 +448,40 @@ def main() -> None:
         with c2:
             target_language = st.selectbox("Target language", LANGUAGE_OPTIONS, index=1)
         with c3:
-            segment_style = st.selectbox("Target segment size", ["Short", "Medium", "Long"], index=1)
+            target_duration_seconds = st.slider(
+                "Target segment duration (seconds)",
+                min_value=8,
+                max_value=60,
+                value=30,
+                step=1,
+            )
 
-        target_chars_map = {"Short": 220, "Medium": 380, "Long": 650}
-        target_chars = target_chars_map[segment_style]
+        min_segment_chars = st.slider(
+            "Minimum segment characters",
+            min_value=60,
+            max_value=500,
+            value=120,
+            step=10,
+        )
+        max_segment_chars = st.slider(
+            "Maximum segment characters",
+            min_value=200,
+            max_value=1200,
+            value=800,
+            step=20,
+        )
+
+        if min_segment_chars > max_segment_chars:
+            st.warning("Minimum segment characters cannot exceed maximum. Using maximum value for both.")
+            min_segment_chars = max_segment_chars
+
+        chars_per_minute = 760
+        target_chars = round(target_duration_seconds * chars_per_minute / 60)
+        target_chars = max(min_segment_chars, min(target_chars, max_segment_chars))
+        st.caption(
+            f"Computed target segment size: ~{target_chars} chars "
+            f"({target_duration_seconds}s at ~{chars_per_minute} chars/min)."
+        )
 
         source_instructions = st.text_input(
             "Source voice instructions (only for GPT-4o mini TTS)",
@@ -471,7 +501,14 @@ def main() -> None:
     if source_text.strip():
         segments_preview = [
             Segment(idx=i + 1, source_text=s, source_chars=len(s))
-            for i, s in enumerate(segment_text(source_text, target_chars=target_chars))
+            for i, s in enumerate(
+                segment_text(
+                    source_text,
+                    target_chars=target_chars,
+                    min_chars=min_segment_chars,
+                    max_chars=max_segment_chars,
+                )
+            )
         ]
         with st.expander(f"Segment preview ({len(segments_preview)} segments)", expanded=False):
             for seg in segments_preview:
@@ -492,7 +529,14 @@ def main() -> None:
         client = OpenAI(api_key=api_key.strip())
         base_segments = [
             Segment(idx=i + 1, source_text=s, source_chars=len(s))
-            for i, s in enumerate(segment_text(source_text, target_chars=target_chars))
+            for i, s in enumerate(
+                segment_text(
+                    source_text,
+                    target_chars=target_chars,
+                    min_chars=min_segment_chars,
+                    max_chars=max_segment_chars,
+                )
+            )
         ]
 
         if not base_segments:
@@ -578,6 +622,13 @@ def main() -> None:
                     "target_voice": target_voice,
                     "speed": speed,
                     "source_first": source_first,
+                    "segmentation_settings": {
+                        "target_duration_seconds": target_duration_seconds,
+                        "chars_per_minute": chars_per_minute,
+                        "target_chars": target_chars,
+                        "min_segment_chars": min_segment_chars,
+                        "max_segment_chars": max_segment_chars,
+                    },
                     "segments": [asdict(s) for s in translated_segments],
                     "estimated_cost_usd": {
                         "translation": round(estimate_translation_cost(translation_model, source_text), 6),
