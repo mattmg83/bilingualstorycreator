@@ -111,6 +111,7 @@ DEFAULT_SETTINGS = {
     "target_voice": "shimmer",
     "speed": 1.0,
     "output_format": "wav",
+    "output_basename": "bilingual_audio",
     "source_first": True,
     "target_duration_seconds": 30,
     "min_segment_chars": 120,
@@ -416,6 +417,9 @@ def make_fingerprint(payload: dict) -> str:
 def ensure_state() -> None:
     if "settings" not in st.session_state:
         st.session_state["settings"] = DEFAULT_SETTINGS.copy()
+    else:
+        for key, value in DEFAULT_SETTINGS.items():
+            st.session_state["settings"].setdefault(key, value)
     if "base_segments" not in st.session_state:
         st.session_state["base_segments"] = []
     if "prepared_fingerprint" not in st.session_state:
@@ -569,22 +573,41 @@ def render_prepare_tab(configured_api_key: str) -> None:
 
             st.divider()
             st.caption("Generation controls")
-            translation_model = st.selectbox(
-                "Translation model",
-                options=list(TRANSLATION_MODELS.keys()),
-                index=list(TRANSLATION_MODELS.keys()).index(settings["translation_model"]),
-                format_func=lambda k: TRANSLATION_MODELS[k]["label"],
+            gc1, gc2 = st.columns(2)
+            with gc1:
+                translation_model = st.selectbox(
+                    "Translation model",
+                    options=list(TRANSLATION_MODELS.keys()),
+                    index=list(TRANSLATION_MODELS.keys()).index(settings["translation_model"]),
+                    format_func=lambda k: TRANSLATION_MODELS[k]["label"],
+                )
+            with gc2:
+                tts_model = st.selectbox(
+                    "TTS model",
+                    options=list(TTS_MODELS.keys()),
+                    index=list(TTS_MODELS.keys()).index(settings["tts_model"]),
+                    format_func=lambda k: TTS_MODELS[k]["label"],
+                )
+
+            gc3, gc4 = st.columns(2)
+            with gc3:
+                source_voice = st.selectbox("Source voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["source_voice"]))
+            with gc4:
+                target_voice = st.selectbox("Target voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["target_voice"]))
+
+            gc5, gc6 = st.columns(2)
+            with gc5:
+                speed = st.slider("Speech speed", min_value=0.75, max_value=1.25, value=settings["speed"], step=0.05)
+            with gc6:
+                output_format = st.selectbox(
+                    "Audio output format", options=["wav", "mp3"], index=["wav", "mp3"].index(settings["output_format"])
+                )
+
+            output_basename = st.text_input(
+                "Output audio base name",
+                value=settings["output_basename"],
+                help="Used for exported full audio downloads (example: lesson_01).",
             )
-            tts_model = st.selectbox(
-                "TTS model",
-                options=list(TTS_MODELS.keys()),
-                index=list(TTS_MODELS.keys()).index(settings["tts_model"]),
-                format_func=lambda k: TTS_MODELS[k]["label"],
-            )
-            source_voice = st.selectbox("Source voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["source_voice"]))
-            target_voice = st.selectbox("Target voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["target_voice"]))
-            speed = st.slider("Speech speed", min_value=0.75, max_value=1.25, value=settings["speed"], step=0.05)
-            output_format = st.selectbox("Audio output format", options=["wav", "mp3"], index=["wav", "mp3"].index(settings["output_format"]))
             source_first = st.toggle("Source language first in alternating file", value=settings["source_first"])
 
             source_instructions = st.text_input(
@@ -610,6 +633,7 @@ def render_prepare_tab(configured_api_key: str) -> None:
                 "target_voice": target_voice,
                 "speed": speed,
                 "output_format": output_format,
+                "output_basename": output_basename.strip() or "bilingual_audio",
                 "source_first": source_first,
                 "target_duration_seconds": target_duration_seconds,
                 "min_segment_chars": min_segment_chars,
@@ -835,6 +859,7 @@ def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
         "speed": settings["speed"],
         "source_first": settings["source_first"],
         "output_format": settings["output_format"],
+        "output_basename": settings["output_basename"],
         "segmentation_settings": {
             "target_duration_seconds": settings["target_duration_seconds"],
             "chars_per_minute": 760,
@@ -912,6 +937,7 @@ def render_audio_tab(api_key: str) -> None:
 def render_export_tab() -> None:
     artifacts = st.session_state.get("artifacts", {})
     manifest = st.session_state.get("manifest", {})
+    settings = st.session_state.get("settings", {})
     st.subheader("Export")
 
     if not artifacts:
@@ -926,12 +952,19 @@ def render_export_tab() -> None:
     mime_type = "audio/wav" if manifest.get("output_format", "wav") == "wav" else "audio/mpeg"
     audio_format = "audio/wav" if manifest.get("output_format", "wav") == "wav" else "audio/mp3"
 
+    output_basename = settings.get("output_basename", "bilingual_audio").strip() or "bilingual_audio"
+    custom_names = {
+        full_keys[0]: f"{output_basename}.{manifest.get('output_format', 'wav')}",
+        full_keys[1]: f"{output_basename}_source.{manifest.get('output_format', 'wav')}",
+        full_keys[2]: f"{output_basename}_target.{manifest.get('output_format', 'wav')}",
+    }
+
     for key in full_keys:
         if key in artifacts:
             st.download_button(
-                label=f"Download {key}",
+                label=f"Download {custom_names[key]}",
                 data=artifacts[key],
-                file_name=key,
+                file_name=custom_names[key],
                 mime=mime_type,
             )
             st.audio(artifacts[key], format=audio_format)
