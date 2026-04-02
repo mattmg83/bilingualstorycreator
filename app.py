@@ -6,6 +6,7 @@ import math
 import re
 import wave
 import zipfile
+import os
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -413,9 +414,15 @@ def main() -> None:
     if "manifest" not in st.session_state:
         st.session_state["manifest"] = {}
 
+    configured_api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+
     with st.sidebar:
         st.header("OpenAI settings")
-        api_key = st.text_input("OpenAI API key", type="password", help="Used only for this session.")
+        if configured_api_key:
+            st.success("Using OPENAI_API_KEY from secrets/environment.")
+            api_key = configured_api_key
+        else:
+            api_key = st.text_input("OpenAI API key", type="password", help="Used only for this session.")
         translation_model = st.selectbox(
             "Translation model",
             options=list(TRANSLATION_MODELS.keys()),
@@ -473,7 +480,7 @@ def main() -> None:
 
     if generate:
         if not api_key.strip():
-            st.error("Enter an OpenAI API key.")
+            st.error("Set OPENAI_API_KEY in Streamlit secrets (recommended) or enter it in the sidebar.")
             return
         if not source_text.strip():
             st.error("Enter source text.")

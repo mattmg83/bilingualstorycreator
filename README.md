@@ -1,51 +1,89 @@
 # Bilingual Text-to-Audio Composer
 
-A small Streamlit app that takes raw text, translates it with the OpenAI API, segments it into natural chunks, generates two sets of WAV files using OpenAI text-to-speech, and exports:
+Streamlit app that translates text and generates bilingual WAV outputs:
 
 - `full_source.wav`
 - `full_target.wav`
 - `alternating_bilingual.wav`
-- a ZIP with all segment files plus `manifest.json`
+- ZIP with per-segment files + `manifest.json`
 
-## Features
+## Recommended stack (simplest)
 
-- text-only workflow
-- OpenAI API key entered directly in the UI
-- translation model choice
-- TTS model choice
-- cost estimate panel with model-pair comparison
-- source/target voice selection
-- WAV concatenation without ffmpeg
-- segment preview before generation
+**Use Streamlit Community Cloud** for hosting.
 
-## Run
+Why this is simplest:
+- no container setup
+- no custom web server
+- built for Streamlit apps
+- easy secret management
+
+Dependency risk: **Low** (Streamlit + OpenAI SDK only).  
+Hosting complexity: **Low** (single hosted app).  
+Maintenance burden: **Low** (mostly dependency updates).
+
+## Python version
+
+This repo targets **Python 3.13.2** (also pinned in `runtime.txt`).
+
+## Local run
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Deploy (recommended): Streamlit Community Cloud
+
+### Required secret
+
+Add this in Streamlit app settings → **Secrets**:
+
+```toml
+OPENAI_API_KEY = "your_openai_api_key"
+```
+
+> The app supports manual API key entry in the sidebar for local testing, but hosted deploys should use secrets.
+
+### Exact deployment steps
+
+1. Push this repo to GitHub.
+2. Go to Streamlit Community Cloud and click **Create app**.
+3. Select your repo + branch.
+4. Set **Main file path** to `app.py`.
+5. In **Advanced settings → Secrets**, paste:
+
+   ```toml
+   OPENAI_API_KEY = "your_openai_api_key"
+   ```
+6. Deploy.
+
+### Expected startup command
+
+Streamlit Cloud runs the app file directly (`app.py`).
+Equivalent local startup command:
+
+```bash
+streamlit run app.py
+```
+
+## Local dev vs hosted
+
+- **API key source**
+  - Local: usually typed into sidebar (or set `OPENAI_API_KEY` env var).
+  - Hosted: should come from Streamlit Secrets (`OPENAI_API_KEY`).
+
+- **Networking**
+  - Local: uses your machine defaults.
+  - Hosted: uses `.streamlit/config.toml` (`headless`, `0.0.0.0`, relaxed CORS/XSRF for managed proxy setups).
+
+- **Port**
+  - Local: default `8501` unless overridden.
+  - Hosted: platform controls port routing; Streamlit Cloud handles this automatically.
+
 ## Notes
 
-- The app keeps the API key in session memory only.
 - Cost numbers are estimates, not billing records.
-- `gpt-4o-mini-tts` cost is estimated from both text tokens and estimated audio duration.
-- `tts-1` and `tts-1-hd` are estimated from character count.
-- The speech endpoint currently limits each input to 4096 characters, so the app segments input before TTS.
-
-## Pricing/model references used in the code
-
-Checked on 2026-04-01 from official OpenAI docs:
-
-- TTS endpoint and supported models/formats
-- `gpt-4o-mini-tts` pricing
-- `tts-1` pricing
-- `gpt-4o-mini`, `gpt-4.1-mini`, `gpt-5-mini`, `gpt-5-nano`, and `gpt-5` pricing
-- audio token guidance used for `gpt-4o-mini-tts` estimation
-
-## Limitations
-
-- Translation is done segment-by-segment for simplicity.
-- Token estimation uses a rough chars-to-tokens heuristic.
-- Audio generation retries are not implemented yet.
-- Segment alignment is semantic-by-order rather than duration-balanced.
+- Speech input is segmented before TTS to stay within endpoint limits.
+- Translation is segment-by-segment for simplicity.
