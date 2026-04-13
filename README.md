@@ -1,10 +1,10 @@
 # Bilingual Text-to-Audio Composer
 
-Streamlit app that translates text and generates bilingual WAV outputs:
+Streamlit app that translates text and generates bilingual audio outputs:
 
-- `full_source.wav`
-- `full_target.wav`
-- `alternating_bilingual.wav`
+- `full_source.wav` / `full_source.mp3`
+- `full_target.wav` / `full_target.mp3`
+- `alternating_bilingual.wav` / `alternating_bilingual.mp3`
 - ZIP with per-segment files + `manifest.json`
 
 ## Recommended stack (simplest)
@@ -32,6 +32,25 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
+```
+
+## MP3 merge requirements (important)
+
+WAV output is the safe default and works with the base dependencies.
+
+If you choose **MP3 output**, the app uses a safe decode→PCM→re-encode merge flow and needs:
+
+- `pydub` Python package
+- `ffmpeg` installed and available on PATH
+
+Example local setup:
+
+```bash
+pip install pydub
+# macOS (Homebrew)
+brew install ffmpeg
+# Ubuntu/Debian
+sudo apt-get update && sudo apt-get install -y ffmpeg
 ```
 
 ## Deploy (recommended): Streamlit Community Cloud
