@@ -568,7 +568,7 @@ def load_segment_bytes(segment_audio_files: dict, segments: List[Segment], side:
     return blobs
 
 
-def render_prepare_tab(configured_api_key: str) -> None:
+def render_prepare_tab(active_api_key: str) -> None:
     settings = st.session_state["settings"]
     left, right = st.columns([1.2, 1])
 
@@ -696,8 +696,8 @@ def render_prepare_tab(configured_api_key: str) -> None:
             f"({settings['target_duration_seconds']}s at ~{chars_per_minute} chars/min)."
         )
 
-        if configured_api_key:
-            st.success("Using OPENAI_API_KEY from secrets/environment.")
+        if active_api_key:
+            st.success("OpenAI API key is configured for this session.")
 
         if settings["source_text"].strip() and st.session_state["base_segments"]:
             segments_preview = st.session_state["base_segments"]
@@ -1029,10 +1029,20 @@ def main() -> None:
     configured_api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
     with st.sidebar:
         st.header("OpenAI settings")
-        if configured_api_key:
-            api_key = configured_api_key
+        manual_api_key = st.text_input(
+            "OpenAI API key (optional override)",
+            type="password",
+            value=st.session_state.get("manual_api_key", ""),
+            help="If provided, this key is used for API calls. If blank, app falls back to secrets/environment key.",
+        )
+        st.session_state["manual_api_key"] = manual_api_key
+        api_key = manual_api_key.strip() or configured_api_key
+        if manual_api_key.strip():
+            st.caption("Using API key from sidebar input.")
+        elif configured_api_key:
+            st.caption("Using OPENAI_API_KEY from secrets/environment.")
         else:
-            api_key = st.text_input("OpenAI API key", type="password", help="Used only for this session.")
+            st.caption("No API key set yet.")
         st.markdown(
             "Try and compare available voices on the official OpenAI voice page: "
             "[openai.fm](https://www.openai.fm/)."
@@ -1041,7 +1051,7 @@ def main() -> None:
     tab_prepare, tab_translate, tab_audio, tab_export = st.tabs(["Prepare", "Translate", "Generate Audio", "Export"])
 
     with tab_prepare:
-        render_prepare_tab(configured_api_key=configured_api_key)
+        render_prepare_tab(active_api_key=api_key)
     with tab_translate:
         render_translate_tab(api_key=api_key)
     with tab_audio:
