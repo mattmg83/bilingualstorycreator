@@ -1057,20 +1057,12 @@ def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
         st.session_state["temp_audio_dir"] = tempfile.mkdtemp(prefix="bilingual_audio_")
 
     segment_map = {seg.idx: seg for seg in translated_segments}
+    temp_audio_dir = Path(st.session_state["temp_audio_dir"])
+    output_format = settings["output_format"]
     client = get_api_client(api_key.strip())
     progress = st.progress(0.0)
 
-    def generate_one_side(seg_idx: int, side: str) -> dict:
-        seg = segment_map[seg_idx]
-        if side == "source":
-            text = seg.source_text
-            voice = settings["source_voice"]
-            instructions = settings["source_instructions"]
-        else:
-            text = seg.translated_text
-            voice = settings["target_voice"]
-            instructions = settings["target_instructions"]
-
+    def generate_one_side(seg_idx: int, side: str, text: str, voice: str, instructions: str) -> dict:
         blob = tts_segment(
             client=client,
             text=text,
@@ -1078,11 +1070,11 @@ def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
             voice=voice,
             instructions=instructions,
             speed=settings["speed"],
-            response_format=settings["output_format"],
+            response_format=output_format,
         )
-        file_path = Path(st.session_state["temp_audio_dir"]) / f"{side}_{seg_idx:03d}.{settings['output_format']}"
+        file_path = temp_audio_dir / f"{side}_{seg_idx:03d}.{output_format}"
         file_path.write_bytes(blob)
-        rel_name = f"segments/{side}_{seg_idx:03d}.{settings['output_format']}"
+        rel_name = f"segments/{side}_{seg_idx:03d}.{output_format}"
         return {"seg_idx": seg_idx, "side": side, "path": str(file_path), "filename": rel_name}
 
     tasks: List[tuple[int, str, str, str, str]] = []
@@ -1107,7 +1099,10 @@ def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
         if tasks:
             max_workers = min(3, len(tasks))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_map = {executor.submit(generate_one_side, seg_idx, side): (seg_idx, side) for seg_idx, side, _, _, _ in tasks}
+                future_map = {
+                    executor.submit(generate_one_side, seg_idx, side, text, voice, instructions): (seg_idx, side)
+                    for seg_idx, side, text, voice, instructions in tasks
+                }
 
                 for future in as_completed(future_map):
                     seg_idx, side = future_map[future]
