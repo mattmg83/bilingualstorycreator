@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -119,6 +120,8 @@ DEFAULT_SETTINGS = {
     "source_instructions": "Speak clearly and naturally.",
     "target_instructions": "Speak clearly and naturally.",
 }
+
+SOUNDFX_DIR = Path("soundfx")
 
 
 @dataclass
@@ -353,6 +356,28 @@ def build_alternating_wav(source_parts: List[bytes], translated_parts: List[byte
 
 def concat_mp3_bytes(parts: List[bytes]) -> bytes:
     return b"".join(parts)
+
+
+def load_soundfx_mp3_files() -> List[Path]:
+    if not SOUNDFX_DIR.exists():
+        return []
+    return sorted([p for p in SOUNDFX_DIR.glob("*.mp3") if p.is_file()])
+
+
+def interleave_with_random_soundfx(parts: List[bytes], soundfx_files: List[Path]) -> tuple[List[bytes], List[str]]:
+    if not parts:
+        return [], []
+    if len(parts) == 1 or not soundfx_files:
+        return parts, []
+
+    ordered_with_fx: List[bytes] = [parts[0]]
+    used_fx: List[str] = []
+    for part in parts[1:]:
+        chosen_fx = random.choice(soundfx_files)
+        ordered_with_fx.append(chosen_fx.read_bytes())
+        ordered_with_fx.append(part)
+        used_fx.append(chosen_fx.name)
+    return ordered_with_fx, used_fx
 
 
 def estimate_tts_cost(model: str, text_a: str, text_b: str) -> float:
@@ -823,6 +848,7 @@ def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
     segment_audio_files = st.session_state["segment_audio_files"]
     source_parts = load_segment_bytes(segment_audio_files, translated_segments, "source")
     target_parts = load_segment_bytes(segment_audio_files, translated_segments, "target")
+    used_soundfx: List[str] = []
 
     if settings["output_format"] == "wav":
         full_source = concat_wav_bytes(source_parts)
@@ -834,7 +860,9 @@ def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
         ordered_mp3: List[bytes] = []
         for s, t in zip(source_parts, target_parts):
             ordered_mp3.extend([s, t] if settings["source_first"] else [t, s])
-        alternating = concat_mp3_bytes(ordered_mp3)
+        soundfx_files = load_soundfx_mp3_files()
+        alternating_parts, used_soundfx = interleave_with_random_soundfx(ordered_mp3, soundfx_files)
+        alternating = concat_mp3_bytes(alternating_parts)
 
     artifacts: Dict[str, bytes] = {
         f"full_source.{settings['output_format']}": full_source,
@@ -860,6 +888,16 @@ def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
         "source_first": settings["source_first"],
         "output_format": settings["output_format"],
         "output_basename": settings["output_basename"],
+        "alternating_track_transition_soundfx": {
+            "enabled": settings["output_format"] == "mp3",
+            "available_files": [p.name for p in load_soundfx_mp3_files()],
+            "used_files_in_order": used_soundfx if settings["output_format"] == "mp3" else [],
+            "notes": (
+                "Transition sound effects are inserted between alternating segments for MP3 output."
+                if settings["output_format"] == "mp3"
+                else "No transition sound effects applied for WAV output (soundfx files are MP3)."
+            ),
+        },
         "segmentation_settings": {
             "target_duration_seconds": settings["target_duration_seconds"],
             "chars_per_minute": 760,
