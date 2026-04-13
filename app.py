@@ -522,6 +522,8 @@ def ensure_state() -> None:
     else:
         for key, value in DEFAULT_SETTINGS.items():
             st.session_state["settings"].setdefault(key, value)
+    if "draft_source_text" not in st.session_state:
+        st.session_state["draft_source_text"] = st.session_state["settings"]["source_text"]
     if "base_segments" not in st.session_state:
         st.session_state["base_segments"] = []
     if "prepared_fingerprint" not in st.session_state:
@@ -652,8 +654,14 @@ def render_prepare_tab(active_api_key: str) -> None:
     left, right = st.columns([1.2, 1])
 
     with left:
+        st.text_area(
+            "Source text",
+            key="draft_source_text",
+            height=300,
+            placeholder="Paste text here...",
+        )
+
         with st.form("main_controls_form"):
-            source_text = st.text_area("Source text", value=settings["source_text"], height=300, placeholder="Paste text here...")
             c1, c2, c3 = st.columns(3)
             with c1:
                 source_language = st.selectbox(
@@ -728,7 +736,7 @@ def render_prepare_tab(active_api_key: str) -> None:
                 st.warning("Minimum segment characters cannot exceed maximum. Using maximum value for both.")
 
             updated = {
-                "source_text": source_text,
+                "source_text": st.session_state.get("draft_source_text", ""),
                 "source_language": source_language,
                 "target_language": target_language,
                 "translation_model": translation_model,
@@ -787,7 +795,9 @@ def render_prepare_tab(active_api_key: str) -> None:
                     st.write(seg.source_text)
 
     with right:
-        render_cost_panel(settings["source_text"], settings["translation_model"], settings["tts_model"])
+        st.caption("Updates live as you type; final pipeline still uses prepared settings.")
+        live_source_text = st.session_state.get("draft_source_text", settings["source_text"])
+        render_cost_panel(live_source_text, settings["translation_model"], settings["tts_model"])
 
 
 def render_translate_tab(api_key: str) -> None:
