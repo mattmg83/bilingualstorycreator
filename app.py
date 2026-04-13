@@ -18,6 +18,11 @@ from typing import Dict, List
 import streamlit as st
 from openai import OpenAI
 
+try:
+    from pydub import AudioSegment
+except ImportError:  # optional dependency for MP3-safe merge
+    AudioSegment = None
+
 # Pricing constants based on official OpenAI docs checked on 2026-04-01.
 # See README for sources.
 TRANSLATION_MODELS: Dict[str, Dict[str, float | str]] = {
@@ -355,7 +360,28 @@ def build_alternating_wav(source_parts: List[bytes], translated_parts: List[byte
 
 
 def concat_mp3_bytes(parts: List[bytes]) -> bytes:
-    return b"".join(parts)
+    if not parts:
+        return b""
+    if AudioSegment is None:
+        raise RuntimeError(
+            "MP3-safe merge requires optional dependencies. Install pydub and ffmpeg, or switch output format to WAV."
+        )
+
+    combined = AudioSegment.empty()
+    for idx, part in enumerate(parts, start=1):
+        try:
+            combined += AudioSegment.from_file(io.BytesIO(part), format="mp3")
+        except Exception as exc:
+            raise RuntimeError(
+                f"MP3-safe merge failed while decoding segment {idx}. Install/configure ffmpeg, or switch output format to WAV."
+            ) from exc
+
+    out_io = io.BytesIO()
+    try:
+        combined.export(out_io, format="mp3")
+    except Exception as exc:
+        raise RuntimeError("MP3-safe merge failed during MP3 export. Check ffmpeg, or switch output format to WAV.") from exc
+    return out_io.getvalue()
 
 
 def load_soundfx_mp3_files() -> List[Path]:
@@ -855,14 +881,19 @@ def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
         full_target = concat_wav_bytes(target_parts)
         alternating = build_alternating_wav(source_parts, target_parts, source_first=settings["source_first"])
     else:
-        full_source = concat_mp3_bytes(source_parts)
-        full_target = concat_mp3_bytes(target_parts)
-        ordered_mp3: List[bytes] = []
-        for s, t in zip(source_parts, target_parts):
-            ordered_mp3.extend([s, t] if settings["source_first"] else [t, s])
-        soundfx_files = load_soundfx_mp3_files()
-        alternating_parts, used_soundfx = interleave_with_random_soundfx(ordered_mp3, soundfx_files)
-        alternating = concat_mp3_bytes(alternating_parts)
+        try:
+            full_source = concat_mp3_bytes(source_parts)
+            full_target = concat_mp3_bytes(target_parts)
+            ordered_mp3: List[bytes] = []
+            for s, t in zip(source_parts, target_parts):
+                ordered_mp3.extend([s, t] if settings["source_first"] else [t, s])
+            soundfx_files = load_soundfx_mp3_files()
+            alternating_parts, used_soundfx = interleave_with_random_soundfx(ordered_mp3, soundfx_files)
+            alternating = concat_mp3_bytes(alternating_parts)
+        except RuntimeError as exc:
+            st.error(str(exc))
+            st.error("Tip: set audio output format to WAV in Prepare (WAV concatenation is built in).")
+            return
 
     artifacts: Dict[str, bytes] = {
         f"full_source.{settings['output_format']}": full_source,
