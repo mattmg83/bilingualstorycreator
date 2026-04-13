@@ -212,6 +212,9 @@ def segment_text(text: str, target_chars: int, min_chars: int = 120, max_chars: 
     text = normalize_whitespace(text)
     if not text:
         return []
+    if "##" in text:
+        manual_segments = [normalize_whitespace(part) for part in text.split("##")]
+        return [part for part in manual_segments if part]
 
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     units: List[str] = []
@@ -660,6 +663,7 @@ def render_prepare_tab(active_api_key: str) -> None:
             height=300,
             placeholder="Paste text here...",
         )
+        st.caption("Tip: add `##` between chunks to force manual segment breaks (automatic segmentation is skipped).")
 
         with st.form("main_controls_form"):
             c1, c2, c3 = st.columns(3)
@@ -789,6 +793,8 @@ def render_prepare_tab(active_api_key: str) -> None:
 
         if settings["source_text"].strip() and st.session_state["base_segments"]:
             segments_preview = st.session_state["base_segments"]
+            if "##" in settings["source_text"]:
+                st.info("Manual segmentation mode is active (using ## cue points).")
             with st.expander(f"Segment preview ({len(segments_preview)} segments)", expanded=False):
                 for seg in segments_preview:
                     st.markdown(f"**Segment {seg.idx}** ({seg.source_chars} chars)")
