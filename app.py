@@ -9,7 +9,7 @@ import random
 import re
 import shutil
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 import wave
 import zipfile
 from dataclasses import asdict, dataclass
@@ -127,6 +127,7 @@ DEFAULT_SETTINGS = {
     "source_instructions": "Use a warm, cheerful, expressive storytelling tone for young children. Keep pacing clear and friendly.",
     "target_instructions": "Use a warm, cheerful, expressive storytelling tone for young children. Keep pacing clear and friendly.",
     "terminology_map": {},
+    "translation_max_workers": 2,
 }
 
 SOUNDFX_DIR = Path("soundfx")
@@ -263,10 +264,13 @@ def translate_segments(
     on_error: Callable[[int, int, int, str], None] | None = None,
     request_timeout_seconds: float = 45.0,
     max_retries: int = 2,
+    max_workers: int = 2,
     continue_on_error: bool = False,
 ) -> List[Segment]:
-    translated: List[Segment] = []
     total = len(segments)
+    if total == 0:
+        return []
+    safe_max_workers = max(1, min(max_workers, total))
     glossary_section = ""
     if terminology_map:
         glossary_lines = [f"- {source} = {target}" for source, target in terminology_map.items()]
@@ -274,7 +278,8 @@ def translate_segments(
             "\n\nUse these preferred translations exactly when applicable:\n"
             + "\n".join(glossary_lines)
         )
-    for i, seg in enumerate(segments, start=1):
+
+    def translate_one_segment(seg: Segment) -> Segment:
         if target_language == "LinkedIn (satirical)":
             prompt = (
                 "Rewrite the following text as a funny, satirical LinkedIn thought-leadership post. "
@@ -317,27 +322,40 @@ def translate_segments(
                     message = (
                         f"Translation request failed for segment {seg.idx} after {max_retries + 1} attempts: {exc}"
                     )
-                    if on_error:
-                        on_error(i, total, seg.idx, message)
-                    if continue_on_error:
-                        response = None
-                        break
                     raise RuntimeError(message) from exc
         if response is None:
-            continue
-        text = response.output_text.strip()
-        translated.append(
-            Segment(
-                idx=seg.idx,
-                source_text=seg.source_text,
-                translated_text=text,
-                source_chars=len(seg.source_text),
-                translated_chars=len(text),
+            raise RuntimeError(
+                f"Translation request failed for segment {seg.idx} after {max_retries + 1} attempts."
             )
+        text = response.output_text.strip()
+        return Segment(
+            idx=seg.idx,
+            source_text=seg.source_text,
+            translated_text=text,
+            source_chars=len(seg.source_text),
+            translated_chars=len(text),
         )
-        if on_progress:
-            on_progress(i, total, seg.idx)
-    return translated
+
+    translated_by_idx: Dict[int, Segment] = {}
+    completed = 0
+    with ThreadPoolExecutor(max_workers=safe_max_workers) as executor:
+        future_map = {executor.submit(translate_one_segment, seg): seg for seg in segments}
+        for future in as_completed(future_map):
+            seg = future_map[future]
+            completed += 1
+            try:
+                translated_seg = future.result()
+                translated_by_idx[translated_seg.idx] = translated_seg
+                if on_progress:
+                    on_progress(completed, total, seg.idx)
+            except Exception as exc:
+                message = str(exc)
+                if on_error:
+                    on_error(completed, total, seg.idx, message)
+                if not continue_on_error:
+                    raise
+
+    return [translated_by_idx[seg.idx] for seg in segments if seg.idx in translated_by_idx]
 
 
 def create_response_with_timeout(client: OpenAI, model: str, prompt: str, request_timeout_seconds: float):
@@ -847,6 +865,7 @@ def render_prepare_tab(active_api_key: str) -> None:
                 "source_instructions": source_instructions,
                 "target_instructions": target_instructions,
                 "terminology_map": parse_terminology_map(terminology_map_text),
+                "translation_max_workers": settings.get("translation_max_workers", 2),
             }
             chars_per_minute = 760
             target_chars = round(updated["target_duration_seconds"] * chars_per_minute / 60)
@@ -977,6 +996,7 @@ def render_translate_tab(api_key: str) -> None:
                             terminology_map=parse_terminology_map(settings.get("terminology_map")),
                             on_progress=on_progress,
                             on_error=on_error,
+                            max_workers=int(settings.get("translation_max_workers", 2)),
                             continue_on_error=True,
                         )
                         for seg in translated_subset:
@@ -1331,6 +1351,15 @@ def main() -> None:
             st.caption("Using OPENAI_API_KEY from secrets/environment.")
         else:
             st.caption("No API key set yet.")
+        worker_limit = st.slider(
+            "Translation parallel workers",
+            min_value=1,
+            max_value=4,
+            value=int(st.session_state["settings"].get("translation_max_workers", 2)),
+            step=1,
+            help="Lower this if you hit rate limits. 2-3 is usually safest on Streamlit Cloud.",
+        )
+        st.session_state["settings"]["translation_max_workers"] = worker_limit
         st.markdown(
             "Try and compare available voices on the official OpenAI voice page: "
             "[openai.fm](https://www.openai.fm/)."
