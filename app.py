@@ -834,8 +834,13 @@ def render_translate_tab(api_key: str) -> None:
 
     failed_indices = [seg.idx for seg in base_segments if status_map.get(seg.idx, {}).get("error")]
     c1, c2 = st.columns(2)
-    run_all = c1.button("Run translation", type="primary", use_container_width=True)
-    retry_failed = c2.button("Retry failed segments", use_container_width=True, disabled=not failed_indices)
+    run_all = c1.button("Run translation", type="primary", use_container_width=True, key="translation_run_all")
+    retry_failed = c2.button(
+        "Retry failed segments",
+        use_container_width=True,
+        disabled=not failed_indices,
+        key="translation_retry_failed",
+    )
 
     if run_all or retry_failed:
         if run_all and st.session_state.get("translation_fingerprint") == translation_fp and not failed_indices and translated_map:
@@ -1120,7 +1125,12 @@ def render_audio_tab(api_key: str) -> None:
 
     col_a, col_b = st.columns(2)
     with col_a:
-        if st.button("Generate / refresh all audio", type="primary", use_container_width=True):
+        if st.button(
+            "Generate / refresh all audio",
+            type="primary",
+            use_container_width=True,
+            key="audio_generate_refresh_all",
+        ):
             clear_audio_tempdir()
             indices = [seg.idx for seg in st.session_state["translated_segments"]]
             generate_audio_for_indices(api_key=api_key, indices=indices)
@@ -1128,7 +1138,12 @@ def render_audio_tab(api_key: str) -> None:
         failed_indices = [
             idx for idx, status in st.session_state.get("audio_status", {}).items() if status.get("error") or not (status.get("source") and status.get("target"))
         ]
-        if st.button("Retry failed segments", use_container_width=True, disabled=not failed_indices):
+        if st.button(
+            "Retry failed segments",
+            use_container_width=True,
+            disabled=not failed_indices,
+            key="audio_retry_failed",
+        ):
             generate_audio_for_indices(api_key=api_key, indices=sorted(failed_indices))
 
     translated_segments = st.session_state["translated_segments"]
