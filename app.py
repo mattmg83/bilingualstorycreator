@@ -460,6 +460,28 @@ def interleave_with_random_soundfx(parts: List[bytes], soundfx_files: List[Path]
     return ordered_with_fx, used_fx
 
 
+def filter_compatible_wav_soundfx(soundfx_files: List[Path], reference_wav: bytes) -> tuple[List[Path], List[str]]:
+    if not soundfx_files:
+        return [], []
+
+    skipped: List[str] = []
+    compatible: List[Path] = []
+    with wave.open(io.BytesIO(reference_wav), "rb") as ref:
+        ref_sig = (ref.getnchannels(), ref.getsampwidth(), ref.getframerate(), ref.getcomptype())
+
+    for path in soundfx_files:
+        try:
+            with wave.open(str(path), "rb") as fx:
+                fx_sig = (fx.getnchannels(), fx.getsampwidth(), fx.getframerate(), fx.getcomptype())
+            if fx_sig == ref_sig:
+                compatible.append(path)
+            else:
+                skipped.append(path.name)
+        except Exception:
+            skipped.append(path.name)
+    return compatible, skipped
+
+
 def estimate_tts_cost(model: str, text_a: str, text_b: str) -> float:
     total_text = text_a + text_b
     if model in {"tts-1", "tts-1-hd"}:
@@ -1023,7 +1045,14 @@ def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
         ordered_wav: List[bytes] = []
         for s, t in zip(source_parts, target_parts):
             ordered_wav.extend([s, t] if settings["source_first"] else [t, s])
-        alternating_parts, used_soundfx = interleave_with_random_soundfx(ordered_wav, soundfx_files)
+        compatible_soundfx, skipped_soundfx = filter_compatible_wav_soundfx(soundfx_files, ordered_wav[0])
+        if skipped_soundfx:
+            st.info(
+                "Skipped incompatible WAV sound effects: "
+                + ", ".join(skipped_soundfx[:5])
+                + ("..." if len(skipped_soundfx) > 5 else "")
+            )
+        alternating_parts, used_soundfx = interleave_with_random_soundfx(ordered_wav, compatible_soundfx)
         alternating = concat_wav_bytes(alternating_parts)
     else:
         try:
