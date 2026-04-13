@@ -123,8 +123,8 @@ DEFAULT_SETTINGS = {
     "target_duration_seconds": 30,
     "min_segment_chars": 120,
     "max_segment_chars": 800,
-    "source_instructions": "Speak clearly and naturally.",
-    "target_instructions": "Speak clearly and naturally.",
+    "source_instructions": "Use a warm, cheerful, expressive storytelling tone for young children. Keep pacing clear and friendly.",
+    "target_instructions": "Use a warm, cheerful, expressive storytelling tone for young children. Keep pacing clear and friendly.",
     "terminology_map": {},
 }
 
