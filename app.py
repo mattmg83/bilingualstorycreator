@@ -9,11 +9,12 @@ import random
 import re
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import wave
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Callable, Dict, List
 
 import streamlit as st
 from openai import OpenAI
@@ -252,9 +253,15 @@ def translate_segments(
     source_language: str,
     target_language: str,
     model: str,
+    on_progress: Callable[[int, int, int], None] | None = None,
+    on_error: Callable[[int, int, int, str], None] | None = None,
+    request_timeout_seconds: float = 45.0,
+    max_retries: int = 2,
+    continue_on_error: bool = False,
 ) -> List[Segment]:
     translated: List[Segment] = []
-    for seg in segments:
+    total = len(segments)
+    for i, seg in enumerate(segments, start=1):
         if target_language == "LinkedIn (satirical)":
             prompt = (
                 "Rewrite the following text as a funny, satirical LinkedIn thought-leadership post. "
@@ -275,7 +282,29 @@ def translate_segments(
                 "Preserve meaning and tone, keep it natural, and return only the translated text.\n\n"
                 f"Text:\n{seg.source_text}"
             )
-        response = client.responses.create(model=model, input=prompt)
+        response = None
+        for attempt in range(max_retries + 1):
+            try:
+                response = create_response_with_timeout(
+                    client=client,
+                    model=model,
+                    prompt=prompt,
+                    request_timeout_seconds=request_timeout_seconds,
+                )
+                break
+            except Exception as exc:
+                if attempt >= max_retries:
+                    message = (
+                        f"Translation request failed for segment {seg.idx} after {max_retries + 1} attempts: {exc}"
+                    )
+                    if on_error:
+                        on_error(i, total, seg.idx, message)
+                    if continue_on_error:
+                        response = None
+                        break
+                    raise RuntimeError(message) from exc
+        if response is None:
+            continue
         text = response.output_text.strip()
         translated.append(
             Segment(
@@ -286,7 +315,28 @@ def translate_segments(
                 translated_chars=len(text),
             )
         )
+        if on_progress:
+            on_progress(i, total, seg.idx)
     return translated
+
+
+def create_response_with_timeout(client: OpenAI, model: str, prompt: str, request_timeout_seconds: float):
+    def run_request():
+        try:
+            return client.responses.create(model=model, input=prompt, timeout=request_timeout_seconds)
+        except TypeError:
+            return client.responses.create(model=model, input=prompt)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(run_request)
+        try:
+            return future.result(timeout=request_timeout_seconds + 2)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise TimeoutError(
+                f"Request timed out after {request_timeout_seconds:.0f}s. "
+                "This segment can be retried without rerunning everything."
+            ) from exc
 
 
 def write_wav_bytes(response) -> bytes:
@@ -478,6 +528,8 @@ def ensure_state() -> None:
         st.session_state["prepared_fingerprint"] = ""
     if "translated_segments" not in st.session_state:
         st.session_state["translated_segments"] = []
+    if "translation_status" not in st.session_state:
+        st.session_state["translation_status"] = {}
     if "translation_fingerprint" not in st.session_state:
         st.session_state["translation_fingerprint"] = ""
     if "audio_generation_fingerprint" not in st.session_state:
@@ -701,6 +753,7 @@ def render_prepare_tab(active_api_key: str) -> None:
             if prepare_fingerprint != st.session_state.get("prepared_fingerprint"):
                 clear_audio_tempdir()
                 st.session_state["translated_segments"] = []
+                st.session_state["translation_status"] = {}
                 st.session_state["translation_fingerprint"] = ""
                 segment_texts = cached_segment_text(
                     text=updated["source_text"],
@@ -754,44 +807,109 @@ def render_translate_tab(api_key: str) -> None:
         st.error("Set OPENAI_API_KEY in Streamlit secrets/environment or enter it in the sidebar.")
         return
 
-    if st.button("Run translation", type="primary", use_container_width=True):
-        translation_fp = st.session_state["prepared_fingerprint"]
-        if st.session_state.get("translation_fingerprint") == translation_fp and st.session_state.get("translated_segments"):
+    base_segments = st.session_state["base_segments"]
+    translation_fp = st.session_state["prepared_fingerprint"]
+    translated_map = {seg.idx: seg for seg in st.session_state.get("translated_segments", [])}
+    status_map = st.session_state.get("translation_status", {})
+
+    for seg in base_segments:
+        status_map.setdefault(seg.idx, {"done": seg.idx in translated_map, "error": ""})
+    st.session_state["translation_status"] = status_map
+
+    failed_indices = [seg.idx for seg in base_segments if status_map.get(seg.idx, {}).get("error")]
+    c1, c2 = st.columns(2)
+    run_all = c1.button("Run translation", type="primary", use_container_width=True)
+    retry_failed = c2.button("Retry failed segments", use_container_width=True, disabled=not failed_indices)
+
+    if run_all or retry_failed:
+        if run_all and st.session_state.get("translation_fingerprint") == translation_fp and not failed_indices and translated_map:
             st.info("Translation already exists for these inputs. Reusing previous result.")
         else:
-            try:
-                client = get_api_client(api_key.strip())
-                with st.status("Translating segments", expanded=True) as status:
-                    translated = translate_segments(
-                        client=client,
-                        segments=st.session_state["base_segments"],
-                        source_language=settings["source_language"],
-                        target_language=settings["target_language"],
-                        model=settings["translation_model"],
-                    )
-                    st.session_state["translated_segments"] = translated
+            segments_to_run = (
+                [seg for seg in base_segments if seg.idx in failed_indices]
+                if retry_failed
+                else base_segments
+            )
+            if not segments_to_run:
+                st.info("No failed segments to retry.")
+            else:
+                if retry_failed:
+                    for idx in failed_indices:
+                        status_map[idx] = {"done": False, "error": ""}
+                else:
+                    translated_map = {}
+                    status_map = {seg.idx: {"done": False, "error": ""} for seg in base_segments}
+
+                progress_bar = st.progress(0.0)
+                status_text = st.empty()
+                try:
+                    client = get_api_client(api_key.strip())
+                    total = len(segments_to_run)
+
+                    def on_progress(i: int, run_total: int, seg_idx: int) -> None:
+                        progress_bar.progress(i / run_total)
+                        status_text.info(f"Translated segment {seg_idx} ({i}/{run_total})")
+
+                    def on_error(i: int, run_total: int, seg_idx: int, message: str) -> None:
+                        status_map[seg_idx] = {"done": False, "error": f"Segment {seg_idx}: {message}"}
+                        progress_bar.progress(i / run_total)
+                        status_text.warning(f"Failed segment {seg_idx} ({i}/{run_total})")
+
+                    with st.status("Translating segments", expanded=True) as status:
+                        translated_subset = translate_segments(
+                            client=client,
+                            segments=segments_to_run,
+                            source_language=settings["source_language"],
+                            target_language=settings["target_language"],
+                            model=settings["translation_model"],
+                            on_progress=on_progress,
+                            on_error=on_error,
+                            continue_on_error=True,
+                        )
+                        for seg in translated_subset:
+                            translated_map[seg.idx] = seg
+                            status_map[seg.idx] = {"done": True, "error": ""}
+                        status.update(label="Translation run complete", state="complete")
+                        status_text.success(f"Completed {len(translated_subset)}/{total} requested segments.")
+                except Exception as exc:
+                    message = f"Translation run stopped: {exc}"
+                    status_text.error(message)
+                    st.error(message)
+
+                missing = [seg.idx for seg in segments_to_run if seg.idx not in translated_map]
+                if missing:
+                    for idx in missing:
+                        status_map[idx] = {"done": False, "error": f"Segment {idx} failed: translation missing after run."}
+
+                st.session_state["translated_segments"] = [translated_map[seg.idx] for seg in base_segments if seg.idx in translated_map]
+                st.session_state["translation_status"] = status_map
+
+                all_done = len(st.session_state["translated_segments"]) == len(base_segments) and not any(
+                    s.get("error") for s in status_map.values()
+                )
+                if all_done:
                     st.session_state["translation_fingerprint"] = translation_fp
                     clear_audio_tempdir()
-                    status.update(label="Translation complete", state="complete")
-            except Exception as exc:
-                st.exception(exc)
+                else:
+                    st.session_state["translation_fingerprint"] = ""
 
     translated_segments = st.session_state.get("translated_segments", [])
-    if translated_segments:
-        st.success(f"Translated {len(translated_segments)} segments.")
-        st.dataframe(
-            [
-                {
-                    "#": seg.idx,
-                    "Source chars": seg.source_chars,
-                    "Target chars": seg.translated_chars,
-                    "Source text": seg.source_text,
-                    "Translated text": seg.translated_text,
-                }
-                for seg in translated_segments
-            ],
-            use_container_width=True,
+    status_rows = []
+    for seg in base_segments:
+        translated = translated_map.get(seg.idx)
+        seg_status = st.session_state.get("translation_status", {}).get(seg.idx, {})
+        status_rows.append(
+            {
+                "#": seg.idx,
+                "Status": "✅ Done" if seg_status.get("done") else "❌ Failed" if seg_status.get("error") else "— Pending",
+                "Error": seg_status.get("error", ""),
+                "Source chars": seg.source_chars,
+                "Target chars": translated.translated_chars if translated else 0,
+                "Source text": seg.source_text,
+                "Translated text": translated.translated_text if translated else "",
+            }
         )
+    st.dataframe(status_rows, use_container_width=True)
 
 
 def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
@@ -968,6 +1086,12 @@ def render_audio_tab(api_key: str) -> None:
 
     if not st.session_state.get("translated_segments"):
         st.info("Run translation first.")
+        return
+    if len(st.session_state["translated_segments"]) < len(st.session_state.get("base_segments", [])):
+        st.warning("Some segments are not translated yet. Retry failed translation segments before generating audio.")
+        return
+    if any(v.get("error") for v in st.session_state.get("translation_status", {}).values()):
+        st.warning("There are translation errors. Retry failed translation segments before generating audio.")
         return
 
     if not api_key.strip():
