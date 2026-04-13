@@ -43,10 +43,6 @@ If you choose **MP3 output**, the app uses a safe decode→PCM→re-encode merge
 - `pydub` Python package
 - `ffmpeg` installed and available on PATH
 
-This repo already includes:
-- `pydub` in `requirements.txt`
-- `ffmpeg` in `packages.txt` (used by Streamlit Community Cloud)
-
 Example local setup:
 
 ```bash
