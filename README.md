@@ -1,10 +1,10 @@
 # Bilingual Text-to-Audio Composer
 
-Streamlit app that translates text and generates bilingual WAV outputs:
+Streamlit app that translates text and generates bilingual audio outputs:
 
-- `full_source.wav`
-- `full_target.wav`
-- `alternating_bilingual.wav`
+- `full_source.wav` / `full_source.mp3`
+- `full_target.wav` / `full_target.mp3`
+- `alternating_bilingual.wav` / `alternating_bilingual.mp3`
 - ZIP with per-segment files + `manifest.json`
 
 ## Recommended stack (simplest)
@@ -17,7 +17,7 @@ Why this is simplest:
 - built for Streamlit apps
 - easy secret management
 
-Dependency risk: **Low** (Streamlit + OpenAI SDK only).  
+Dependency risk: **Low** (Streamlit + OpenAI SDK + pydub; ffmpeg system package).  
 Hosting complexity: **Low** (single hosted app).  
 Maintenance burden: **Low** (mostly dependency updates).
 
@@ -33,6 +33,36 @@ source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+## MP3 merge requirements (important)
+
+WAV output is the safe default and works with the base dependencies.
+
+If you choose **MP3 output**, the app uses a safe decode→PCM→re-encode merge flow and needs:
+
+- `pydub` Python package
+- `ffmpeg` installed and available on PATH
+
+This repo already includes:
+- `pydub` in `requirements.txt`
+- `ffmpeg` in `packages.txt` (used by Streamlit Community Cloud)
+
+Example local setup:
+
+```bash
+pip install pydub
+# macOS (Homebrew)
+brew install ffmpeg
+# Ubuntu/Debian
+sudo apt-get update && sudo apt-get install -y ffmpeg
+```
+
+## Transition sound effects by format
+
+The app inserts transition SFX in the **alternating** output when matching files exist in `soundfx/`:
+
+- WAV workflow uses `soundfx/*.wav`
+- MP3 workflow uses `soundfx/*.mp3`
 
 ## Deploy (recommended): Streamlit Community Cloud
 
