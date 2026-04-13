@@ -1057,60 +1057,87 @@ def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
         st.session_state["temp_audio_dir"] = tempfile.mkdtemp(prefix="bilingual_audio_")
 
     segment_map = {seg.idx: seg for seg in translated_segments}
+    temp_audio_dir = Path(st.session_state["temp_audio_dir"])
+    output_format = settings["output_format"]
     client = get_api_client(api_key.strip())
     progress = st.progress(0.0)
 
-    with st.status("Generating audio", expanded=True) as status:
-        total_steps = len(indices) * 2
-        completed = 0
-        for seg_idx in indices:
-            seg = segment_map[seg_idx]
-            seg_files = st.session_state["segment_audio_files"].setdefault(seg_idx, {})
-            seg_status = st.session_state["audio_status"].setdefault(seg_idx, {"source": False, "target": False, "error": ""})
-            try:
-                source_blob = tts_segment(
-                    client=client,
-                    text=seg.source_text,
-                    model=settings["tts_model"],
-                    voice=settings["source_voice"],
-                    instructions=settings["source_instructions"],
-                    speed=settings["speed"],
-                    response_format=settings["output_format"],
-                )
-                source_path = Path(st.session_state["temp_audio_dir"]) / f"source_{seg.idx:03d}.{settings['output_format']}"
-                source_path.write_bytes(source_blob)
-                seg_files["source"] = str(source_path)
-                seg.source_audio_filename = f"segments/source_{seg.idx:03d}.{settings['output_format']}"
-                seg_status["source"] = True
-                completed += 1
-                progress.progress(completed / total_steps)
+    def generate_one_side(seg_idx: int, side: str, text: str, voice: str, instructions: str) -> dict:
+        blob = tts_segment(
+            client=client,
+            text=text,
+            model=settings["tts_model"],
+            voice=voice,
+            instructions=instructions,
+            speed=settings["speed"],
+            response_format=output_format,
+        )
+        file_path = temp_audio_dir / f"{side}_{seg_idx:03d}.{output_format}"
+        file_path.write_bytes(blob)
+        rel_name = f"segments/{side}_{seg_idx:03d}.{output_format}"
+        return {"seg_idx": seg_idx, "side": side, "path": str(file_path), "filename": rel_name}
 
-                target_blob = tts_segment(
-                    client=client,
-                    text=seg.translated_text,
-                    model=settings["tts_model"],
-                    voice=settings["target_voice"],
-                    instructions=settings["target_instructions"],
-                    speed=settings["speed"],
-                    response_format=settings["output_format"],
-                )
-                target_path = Path(st.session_state["temp_audio_dir"]) / f"target_{seg.idx:03d}.{settings['output_format']}"
-                target_path.write_bytes(target_blob)
-                seg_files["target"] = str(target_path)
-                seg.translated_audio_filename = f"segments/target_{seg.idx:03d}.{settings['output_format']}"
-                seg_status["target"] = True
-                seg_status["error"] = ""
-                completed += 1
-                progress.progress(completed / total_steps)
-            except Exception as exc:
-                seg_status["error"] = str(exc)
-                st.error(f"Segment {seg_idx} failed: {exc}")
-                completed += 2
-                progress.progress(completed / total_steps)
+    tasks: List[tuple[int, str, str, str, str]] = []
+    for seg_idx in indices:
+        seg = segment_map[seg_idx]
+        seg_files = st.session_state["segment_audio_files"].setdefault(seg_idx, {})
+        seg_status = st.session_state["audio_status"].setdefault(seg_idx, {"source": False, "target": False, "error": ""})
+
+        source_ok = bool(seg_status.get("source")) and bool(seg_files.get("source")) and Path(seg_files["source"]).exists()
+        target_ok = bool(seg_status.get("target")) and bool(seg_files.get("target")) and Path(seg_files["target"]).exists()
+
+        if not source_ok:
+            tasks.append((seg_idx, "source", seg.source_text, settings["source_voice"], settings["source_instructions"]))
+        if not target_ok:
+            tasks.append((seg_idx, "target", seg.translated_text, settings["target_voice"], settings["target_instructions"]))
+
+    with st.status("Generating audio", expanded=True) as status:
+        total_steps = max(1, len(tasks))
+        completed = 0
+        had_failure = False
+
+        if tasks:
+            max_workers = min(3, len(tasks))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(generate_one_side, seg_idx, side, text, voice, instructions): (seg_idx, side)
+                    for seg_idx, side, text, voice, instructions in tasks
+                }
+
+                for future in as_completed(future_map):
+                    seg_idx, side = future_map[future]
+                    seg_status = st.session_state["audio_status"].setdefault(
+                        seg_idx, {"source": False, "target": False, "error": ""}
+                    )
+                    try:
+                        result = future.result()
+                        seg_files = st.session_state["segment_audio_files"].setdefault(seg_idx, {})
+                        seg_files[side] = result["path"]
+                        if side == "source":
+                            segment_map[seg_idx].source_audio_filename = result["filename"]
+                            seg_status["source"] = True
+                        else:
+                            segment_map[seg_idx].translated_audio_filename = result["filename"]
+                            seg_status["target"] = True
+                        if seg_status.get("source") and seg_status.get("target"):
+                            seg_status["error"] = ""
+                    except Exception as exc:
+                        had_failure = True
+                        seg_status["error"] = str(exc)
+                        st.error(f"Segment {seg_idx} {side} failed: {exc}")
+
+                    completed += 1
+                    progress.progress(completed / total_steps)
+        else:
+            progress.progress(1.0)
 
         status.update(label="Audio generation run complete", state="complete")
 
     st.session_state["translated_segments"] = translated_segments
+
+    if tasks and had_failure:
+        st.warning("Some segments failed. Review failures below and retry failed segments.")
+        return
 
     all_done = True
     for seg in translated_segments:
