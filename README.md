@@ -113,3 +113,18 @@ streamlit run app.py
 - Cost numbers are estimates, not billing records.
 - Speech input is segmented before TTS to stay within endpoint limits.
 - Translation is segment-by-segment for simplicity.
+
+## Manual segmentation with `##`
+
+If your source text includes `##`, the app switches to manual segmentation mode:
+
+- each `##` acts as a segment cue point
+- automatic sentence/character-based segmentation is skipped
+- `##` markers are removed from segment text
+- empty chunks are ignored
+
+Example:
+
+```text
+Hello and welcome. ## This is section two. ## Final section.
+```
