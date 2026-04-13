@@ -282,7 +282,11 @@ def translate_segments(
         else:
             prompt = (
                 f"Translate the following text from {source_language} to {target_language}. "
-                "Preserve meaning and tone, keep it natural, and return only the translated text.\n\n"
+                "Use the same translation for recurring terms throughout all segments. "
+                "If a source term repeats, keep the exact same target term unless grammar requires inflection. "
+                "Prefer child-friendly, simple vocabulary. "
+                "Preserve named entities exactly unless there is a standard localized form. "
+                "Return only translated text with no commentary.\n\n"
                 f"Text:\n{seg.source_text}"
             )
         response = None
