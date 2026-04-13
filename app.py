@@ -125,6 +125,7 @@ DEFAULT_SETTINGS = {
     "max_segment_chars": 800,
     "source_instructions": "Speak clearly and naturally.",
     "target_instructions": "Speak clearly and naturally.",
+    "terminology_map": {},
 }
 
 SOUNDFX_DIR = Path("soundfx")
@@ -256,6 +257,7 @@ def translate_segments(
     source_language: str,
     target_language: str,
     model: str,
+    terminology_map: Dict[str, str] | None = None,
     on_progress: Callable[[int, int, int], None] | None = None,
     on_error: Callable[[int, int, int, str], None] | None = None,
     request_timeout_seconds: float = 45.0,
@@ -264,6 +266,13 @@ def translate_segments(
 ) -> List[Segment]:
     translated: List[Segment] = []
     total = len(segments)
+    glossary_section = ""
+    if terminology_map:
+        glossary_lines = [f"- {source} = {target}" for source, target in terminology_map.items()]
+        glossary_section = (
+            "\n\nUse these preferred translations exactly when applicable:\n"
+            + "\n".join(glossary_lines)
+        )
     for i, seg in enumerate(segments, start=1):
         if target_language == "LinkedIn (satirical)":
             prompt = (
@@ -272,12 +281,14 @@ def translate_segments(
                 f"and preserve the original meaning as much as possible. Source language: {source_language}. "
                 "Return only the rewritten text.\n\n"
                 f"Text:\n{seg.source_text}"
+                f"{glossary_section}"
             )
         elif source_language == "LinkedIn (satirical)":
             prompt = (
                 f"Translate the following text from satirical LinkedIn thought-leadership style into {target_language}. "
                 "Remove cliché corporate tone while preserving the core meaning. Return only the translated text.\n\n"
                 f"Text:\n{seg.source_text}"
+                f"{glossary_section}"
             )
         else:
             prompt = (
@@ -288,6 +299,7 @@ def translate_segments(
                 "Preserve named entities exactly unless there is a standard localized form. "
                 "Return only translated text with no commentary.\n\n"
                 f"Text:\n{seg.source_text}"
+                f"{glossary_section}"
             )
         response = None
         for attempt in range(max_retries + 1):
@@ -633,12 +645,57 @@ def render_cost_panel(source_text: str, selected_translation_model: str, selecte
     st.dataframe(table_data, use_container_width=True)
 
 
+def parse_terminology_map(raw_value: str | dict | None) -> Dict[str, str]:
+    if isinstance(raw_value, dict):
+        parsed_from_dict: Dict[str, str] = {}
+        for key, value in raw_value.items():
+            src = str(key).strip()
+            tgt = str(value).strip()
+            if src and tgt:
+                parsed_from_dict[src] = tgt
+        return parsed_from_dict
+
+    if not raw_value:
+        return {}
+
+    raw_text = str(raw_value).strip()
+    if not raw_text:
+        return {}
+
+    try:
+        maybe_json = json.loads(raw_text)
+        if isinstance(maybe_json, dict):
+            return parse_terminology_map(maybe_json)
+    except json.JSONDecodeError:
+        pass
+
+    parsed: Dict[str, str] = {}
+    for line in raw_text.splitlines():
+        cleaned = line.strip()
+        if not cleaned or "=" not in cleaned:
+            continue
+        source, target = cleaned.split("=", 1)
+        source = source.strip()
+        target = target.strip()
+        if source and target:
+            parsed[source] = target
+    return parsed
+
+
+def terminology_map_to_text(terminology_map: str | dict | None) -> str:
+    parsed = parse_terminology_map(terminology_map)
+    if not parsed:
+        return ""
+    return "\n".join(f"{source}={target}" for source, target in parsed.items())
+
+
 def get_prepare_fingerprint(settings: dict, target_chars: int) -> str:
     payload = {
         "source_text": settings["source_text"],
         "source_language": settings["source_language"],
         "target_language": settings["target_language"],
         "translation_model": settings["translation_model"],
+        "terminology_map": parse_terminology_map(settings.get("terminology_map")),
         "segment": {
             "target_chars": target_chars,
             "min_segment_chars": settings["min_segment_chars"],
@@ -758,6 +815,12 @@ def render_prepare_tab(active_api_key: str) -> None:
             target_instructions = st.text_input(
                 "Target voice instructions (only for GPT-4o mini TTS)", value=settings["target_instructions"]
             )
+            terminology_map_text = st.text_area(
+                "Preferred terms (source=target per line)",
+                value=terminology_map_to_text(settings.get("terminology_map")),
+                height=120,
+                help="Optional glossary. Malformed lines are ignored.",
+            )
             submitted = st.form_submit_button("Apply settings & prepare", type="primary", use_container_width=True)
 
         if submitted:
@@ -782,6 +845,7 @@ def render_prepare_tab(active_api_key: str) -> None:
                 "max_segment_chars": max_segment_chars,
                 "source_instructions": source_instructions,
                 "target_instructions": target_instructions,
+                "terminology_map": parse_terminology_map(terminology_map_text),
             }
             chars_per_minute = 760
             target_chars = round(updated["target_duration_seconds"] * chars_per_minute / 60)
@@ -909,6 +973,7 @@ def render_translate_tab(api_key: str) -> None:
                             source_language=settings["source_language"],
                             target_language=settings["target_language"],
                             model=settings["translation_model"],
+                            terminology_map=parse_terminology_map(settings.get("terminology_map")),
                             on_progress=on_progress,
                             on_error=on_error,
                             continue_on_error=True,
