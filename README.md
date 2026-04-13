@@ -17,7 +17,7 @@ Why this is simplest:
 - built for Streamlit apps
 - easy secret management
 
-Dependency risk: **Low** (Streamlit + OpenAI SDK only).  
+Dependency risk: **Low** (Streamlit + OpenAI SDK + pydub; ffmpeg system package).  
 Hosting complexity: **Low** (single hosted app).  
 Maintenance burden: **Low** (mostly dependency updates).
 
@@ -52,6 +52,13 @@ brew install ffmpeg
 # Ubuntu/Debian
 sudo apt-get update && sudo apt-get install -y ffmpeg
 ```
+
+## Transition sound effects by format
+
+The app inserts transition SFX in the **alternating** output when matching files exist in `soundfx/`:
+
+- WAV workflow uses `soundfx/*.wav`
+- MP3 workflow uses `soundfx/*.mp3`
 
 ## Deploy (recommended): Streamlit Community Cloud
 
