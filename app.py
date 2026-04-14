@@ -790,56 +790,56 @@ def render_prepare_tab(active_api_key: str) -> None:
             )
 
             st.divider()
-            st.caption("Generation controls")
-            gc1, gc2 = st.columns(2)
-            with gc1:
-                translation_model = st.selectbox(
-                    "Translation model",
-                    options=list(TRANSLATION_MODELS.keys()),
-                    index=list(TRANSLATION_MODELS.keys()).index(settings["translation_model"]),
-                    format_func=lambda k: TRANSLATION_MODELS[k]["label"],
+            with st.expander("Generation controls", expanded=False):
+                gc1, gc2 = st.columns(2)
+                with gc1:
+                    translation_model = st.selectbox(
+                        "Translation model",
+                        options=list(TRANSLATION_MODELS.keys()),
+                        index=list(TRANSLATION_MODELS.keys()).index(settings["translation_model"]),
+                        format_func=lambda k: TRANSLATION_MODELS[k]["label"],
+                    )
+                with gc2:
+                    tts_model = st.selectbox(
+                        "TTS model",
+                        options=list(TTS_MODELS.keys()),
+                        index=list(TTS_MODELS.keys()).index(settings["tts_model"]),
+                        format_func=lambda k: TTS_MODELS[k]["label"],
+                    )
+
+                gc3, gc4 = st.columns(2)
+                with gc3:
+                    source_voice = st.selectbox("Source voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["source_voice"]))
+                with gc4:
+                    target_voice = st.selectbox("Target voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["target_voice"]))
+
+                gc5, gc6 = st.columns(2)
+                with gc5:
+                    speed = st.slider("Speech speed", min_value=0.75, max_value=1.25, value=settings["speed"], step=0.05)
+                with gc6:
+                    output_format = st.selectbox(
+                        "Audio output format", options=["wav", "mp3"], index=["wav", "mp3"].index(settings["output_format"])
+                    )
+
+                output_basename = st.text_input(
+                    "Output audio base name",
+                    value=settings["output_basename"],
+                    help="Used for exported full audio downloads (example: lesson_01).",
                 )
-            with gc2:
-                tts_model = st.selectbox(
-                    "TTS model",
-                    options=list(TTS_MODELS.keys()),
-                    index=list(TTS_MODELS.keys()).index(settings["tts_model"]),
-                    format_func=lambda k: TTS_MODELS[k]["label"],
+                source_first = st.toggle("Source language first in alternating file", value=settings["source_first"])
+
+                source_instructions = st.text_input(
+                    "Source voice instructions (only for GPT-4o mini TTS)", value=settings["source_instructions"]
                 )
-
-            gc3, gc4 = st.columns(2)
-            with gc3:
-                source_voice = st.selectbox("Source voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["source_voice"]))
-            with gc4:
-                target_voice = st.selectbox("Target voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["target_voice"]))
-
-            gc5, gc6 = st.columns(2)
-            with gc5:
-                speed = st.slider("Speech speed", min_value=0.75, max_value=1.25, value=settings["speed"], step=0.05)
-            with gc6:
-                output_format = st.selectbox(
-                    "Audio output format", options=["wav", "mp3"], index=["wav", "mp3"].index(settings["output_format"])
+                target_instructions = st.text_input(
+                    "Target voice instructions (only for GPT-4o mini TTS)", value=settings["target_instructions"]
                 )
-
-            output_basename = st.text_input(
-                "Output audio base name",
-                value=settings["output_basename"],
-                help="Used for exported full audio downloads (example: lesson_01).",
-            )
-            source_first = st.toggle("Source language first in alternating file", value=settings["source_first"])
-
-            source_instructions = st.text_input(
-                "Source voice instructions (only for GPT-4o mini TTS)", value=settings["source_instructions"]
-            )
-            target_instructions = st.text_input(
-                "Target voice instructions (only for GPT-4o mini TTS)", value=settings["target_instructions"]
-            )
-            terminology_map_text = st.text_area(
-                "Preferred terms (source=target per line)",
-                value=terminology_map_to_text(settings.get("terminology_map")),
-                height=120,
-                help="Optional glossary. Malformed lines are ignored.",
-            )
+                terminology_map_text = st.text_area(
+                    "Preferred terms (source=target per line)",
+                    value=terminology_map_to_text(settings.get("terminology_map")),
+                    height=120,
+                    help="Optional glossary. Malformed lines are ignored.",
+                )
             submitted = st.form_submit_button("Apply settings & prepare", type="primary", use_container_width=True)
 
         if submitted:
@@ -913,7 +913,8 @@ def render_prepare_tab(active_api_key: str) -> None:
     with right:
         st.caption("Updates live as you type; final pipeline still uses prepared settings.")
         live_source_text = st.session_state.get("draft_source_text", settings["source_text"])
-        render_cost_panel(live_source_text, settings["translation_model"], settings["tts_model"])
+        with st.expander("Cost estimation", expanded=False):
+            render_cost_panel(live_source_text, settings["translation_model"], settings["tts_model"])
 
 
 def render_translate_tab(api_key: str) -> None:
@@ -1355,9 +1356,12 @@ def render_export_tab() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Bilingual Text-to-Audio Composer", layout="wide")
-    st.title("Bilingual Text-to-Audio Composer")
-    st.write("Generate source-language audio, translated-language audio, and an alternating bilingual WAV file from raw text.")
+    st.set_page_config(page_title="Bilingual story creator", layout="wide")
+    st.title("Bilingual story creator")
+    st.write(
+        "Generate a bilingual story from just text. One story generates three spoken audio files: "
+        "two single language versions and a combined alternating bilingual version"
+    )
 
     ensure_state()
 

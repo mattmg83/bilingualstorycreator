@@ -1,4 +1,4 @@
-# Bilingual Text-to-Audio Composer
+# Bilingual story creator
 
 Streamlit app that translates text and generates bilingual audio outputs:
 
