@@ -669,6 +669,24 @@ def clear_audio_tempdir() -> None:
     st.session_state["audio_generation_fingerprint"] = ""
 
 
+def start_new_project() -> None:
+    clear_audio_tempdir()
+    st.cache_data.clear()
+    keys_to_remove = [k for k in st.session_state.keys() if k.startswith("edit_src_") or k.startswith("edit_tgt_")]
+    for key in keys_to_remove:
+        del st.session_state[key]
+    st.session_state["settings"] = DEFAULT_SETTINGS.copy()
+    st.session_state["draft_source_text"] = ""
+    st.session_state["base_segments"] = []
+    st.session_state["prepared_fingerprint"] = ""
+    st.session_state["translated_segments"] = []
+    st.session_state["translation_status"] = {}
+    st.session_state["translation_fingerprint"] = ""
+    st.session_state["manifest"] = {}
+    st.success("Started a new project. Cleared cached data and reset all story content.")
+    st.rerun()
+
+
 def get_api_client(api_key: str) -> OpenAI:
     key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
     if st.session_state.get("api_client") is None or st.session_state.get("api_key_fingerprint") != key_hash:
@@ -1499,6 +1517,14 @@ def render_export_tab() -> None:
     manifest = st.session_state.get("manifest", {})
     settings = st.session_state.get("settings", {})
     st.subheader("Export")
+    st.warning("Need a fresh start? Clear cache + abandon this project and start a new one.")
+    if st.button(
+        "🧹 Start a new project (clear cache)",
+        type="primary",
+        use_container_width=True,
+        key="export_start_new_project",
+    ):
+        start_new_project()
 
     if not artifacts:
         st.info("Generate audio first, then downloads will appear here.")
@@ -1581,6 +1607,10 @@ def main() -> None:
             "Try and compare available voices on the official OpenAI voice page: "
             "[openai.fm](https://www.openai.fm/)."
         )
+        st.divider()
+        st.caption("Project controls")
+        if st.button("Start new project", use_container_width=True, key="sidebar_start_new_project"):
+            start_new_project()
 
     tab_prepare, tab_translate, tab_audio, tab_export = st.tabs(["Prepare", "Translate", "Generate Audio", "Export"])
 
