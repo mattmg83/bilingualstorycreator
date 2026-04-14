@@ -122,12 +122,19 @@ DEFAULT_SETTINGS = {
     "output_basename": "bilingual_audio",
     "source_first": True,
     "target_duration_seconds": 30,
+    "segment_length": "medium",
     "min_segment_chars": 120,
     "max_segment_chars": 800,
     "source_instructions": "Use a warm, cheerful, expressive storytelling tone for young children. Keep pacing clear and friendly.",
     "target_instructions": "Use a warm, cheerful, expressive storytelling tone for young children. Keep pacing clear and friendly.",
     "terminology_map": {},
     "translation_max_workers": 2,
+}
+
+SEGMENT_LENGTH_OPTIONS = {
+    "short": 25,
+    "medium": 50,
+    "long": 75,
 }
 
 SOUNDFX_DIR = Path("soundfx")
@@ -251,6 +258,34 @@ def segment_text(text: str, target_chars: int, min_chars: int = 120, max_chars: 
 @st.cache_data(ttl=3600, max_entries=64)
 def cached_segment_text(text: str, target_chars: int, min_chars: int, max_chars: int) -> List[str]:
     return segment_text(text=text, target_chars=target_chars, min_chars=min_chars, max_chars=max_chars)
+
+
+def segment_text_with_openai(client: OpenAI, text: str, target_words: int) -> List[str]:
+    prompt = (
+        "Segment the text into a JSON array of strings.\n"
+        "Rules:\n"
+        f"- Aim for about {target_words} words per segment.\n"
+        "- Keep the original meaning and order exactly.\n"
+        "- Do not omit or add content.\n"
+        "- Return JSON array only, no markdown, no commentary.\n\n"
+        "Text:\n"
+        f"{text}"
+    )
+    response = client.responses.create(model="gpt-5-mini", input=prompt)
+    raw_text = response.output_text.strip()
+    try:
+        maybe_array = json.loads(raw_text)
+    except json.JSONDecodeError:
+        match = re.search(r"\[[\s\S]*\]", raw_text)
+        if not match:
+            raise
+        maybe_array = json.loads(match.group(0))
+    if not isinstance(maybe_array, list):
+        raise ValueError("Segmentation response is not a JSON array.")
+    segments = [normalize_whitespace(str(item)) for item in maybe_array if isinstance(item, str) and str(item).strip()]
+    if not segments:
+        raise ValueError("Segmentation response returned an empty segment list.")
+    return segments
 
 
 def translate_segments(
@@ -717,6 +752,7 @@ def get_prepare_fingerprint(settings: dict, target_chars: int) -> str:
         "terminology_map": parse_terminology_map(settings.get("terminology_map")),
         "segment": {
             "target_chars": target_chars,
+            "segment_length": settings.get("segment_length", "medium"),
             "min_segment_chars": settings["min_segment_chars"],
             "max_segment_chars": settings["max_segment_chars"],
             "target_duration_seconds": settings["target_duration_seconds"],
@@ -765,7 +801,10 @@ def render_prepare_tab(active_api_key: str) -> None:
             height=300,
             placeholder="Paste text here...",
         )
-        st.caption("Tip: add `##` between chunks to force manual segment breaks (automatic segmentation is skipped).")
+        st.caption(
+            "Segmentation mode: add `##` between chunks for manual segmentation. "
+            "If `##` is not present, AI segmentation is used (with automatic fallback if needed)."
+        )
 
         with st.form("main_controls_form"):
             c1, c2, c3 = st.columns(3)
@@ -787,6 +826,12 @@ def render_prepare_tab(active_api_key: str) -> None:
             )
             max_segment_chars = st.slider(
                 "Maximum segment characters", min_value=50, max_value=1200, value=settings["max_segment_chars"], step=20
+            )
+            segment_length = st.selectbox(
+                "Segment length",
+                options=list(SEGMENT_LENGTH_OPTIONS.keys()),
+                index=list(SEGMENT_LENGTH_OPTIONS.keys()).index(settings.get("segment_length", "medium")),
+                help="Used by AI segmentation when no manual `##` markers are present.",
             )
 
             st.divider()
@@ -860,6 +905,7 @@ def render_prepare_tab(active_api_key: str) -> None:
                 "output_basename": output_basename.strip() or "bilingual_audio",
                 "source_first": source_first,
                 "target_duration_seconds": target_duration_seconds,
+                "segment_length": segment_length,
                 "min_segment_chars": min_segment_chars,
                 "max_segment_chars": max_segment_chars,
                 "source_instructions": source_instructions,
@@ -877,12 +923,32 @@ def render_prepare_tab(active_api_key: str) -> None:
                 st.session_state["translated_segments"] = []
                 st.session_state["translation_status"] = {}
                 st.session_state["translation_fingerprint"] = ""
-                segment_texts = cached_segment_text(
-                    text=updated["source_text"],
-                    target_chars=target_chars,
-                    min_chars=updated["min_segment_chars"],
-                    max_chars=updated["max_segment_chars"],
-                )
+                source_text = updated["source_text"]
+                uses_manual_markers = "##" in source_text
+                segment_texts: List[str]
+                if uses_manual_markers:
+                    segment_texts = cached_segment_text(
+                        text=source_text,
+                        target_chars=target_chars,
+                        min_chars=updated["min_segment_chars"],
+                        max_chars=updated["max_segment_chars"],
+                    )
+                else:
+                    target_words = SEGMENT_LENGTH_OPTIONS.get(updated.get("segment_length", "medium"), 50)
+                    try:
+                        client = get_api_client(active_api_key)
+                        segment_texts = segment_text_with_openai(client=client, text=source_text, target_words=target_words)
+                    except Exception as exc:
+                        st.error(
+                            "AI segmentation failed. Falling back to heuristic segmentation. "
+                            f"Details: {exc}"
+                        )
+                        segment_texts = cached_segment_text(
+                            text=source_text,
+                            target_chars=target_chars,
+                            min_chars=updated["min_segment_chars"],
+                            max_chars=updated["max_segment_chars"],
+                        )
                 st.session_state["base_segments"] = create_segments_from_texts(segment_texts)
                 st.session_state["prepared_fingerprint"] = prepare_fingerprint
                 st.success("Prepared new segments from current settings.")
@@ -894,8 +960,9 @@ def render_prepare_tab(active_api_key: str) -> None:
         target_chars = round(settings["target_duration_seconds"] * chars_per_minute / 60)
         target_chars = max(settings["min_segment_chars"], min(target_chars, settings["max_segment_chars"]))
         st.caption(
-            f"Computed target segment size: ~{target_chars} chars "
-            f"({settings['target_duration_seconds']}s at ~{chars_per_minute} chars/min)."
+            f"Heuristic fallback target: ~{target_chars} chars "
+            f"({settings['target_duration_seconds']}s at ~{chars_per_minute} chars/min). "
+            f"AI target words: ~{SEGMENT_LENGTH_OPTIONS.get(settings.get('segment_length', 'medium'), 50)}."
         )
 
         if active_api_key:
@@ -904,7 +971,9 @@ def render_prepare_tab(active_api_key: str) -> None:
         if settings["source_text"].strip() and st.session_state["base_segments"]:
             segments_preview = st.session_state["base_segments"]
             if "##" in settings["source_text"]:
-                st.info("Manual segmentation mode is active (using ## cue points).")
+                st.info("Manual segmentation mode is active (using `##` markers).")
+            else:
+                st.info("AI segmentation mode is active (target length applied; heuristic fallback on errors).")
             with st.expander(f"Segment preview ({len(segments_preview)} segments)", expanded=False):
                 for seg in segments_preview:
                     st.markdown(f"**Segment {seg.idx}** ({seg.source_chars} chars)")
