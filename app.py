@@ -1112,6 +1112,8 @@ def render_translate_tab(api_key: str) -> None:
                         for seg in translated_subset:
                             translated_map[seg.idx] = seg
                             status_map[seg.idx] = {"done": True, "error": ""}
+                            st.session_state[f"edit_src_{seg.idx}"] = seg.source_text
+                            st.session_state[f"edit_tgt_{seg.idx}"] = seg.translated_text
                         status.update(label="Translation run complete", state="complete")
                         status_text.success(f"Completed {len(translated_subset)}/{total} requested segments.")
                 except Exception as exc:
@@ -1136,29 +1138,99 @@ def render_translate_tab(api_key: str) -> None:
                 else:
                     st.session_state["translation_fingerprint"] = ""
 
-    translated_segments = st.session_state.get("translated_segments", [])
-    show_translate_debug_cols = st.toggle(
-        "Show detailed translation columns (errors + character counts)",
-        value=False,
-        help="Off by default for a cleaner table view.",
-    )
+    for seg in base_segments:
+        translated = translated_map.get(seg.idx)
+        src_key = f"edit_src_{seg.idx}"
+        tgt_key = f"edit_tgt_{seg.idx}"
+        if src_key not in st.session_state:
+            st.session_state[src_key] = translated.source_text if translated else seg.source_text
+        if tgt_key not in st.session_state:
+            st.session_state[tgt_key] = translated.translated_text if translated else ""
+
+    with st.form("translation_edit_form"):
+        st.markdown("### Review and edit segment text")
+        st.caption("You can edit both source and translated text. Saved edits are used for audio generation.")
+        for seg in base_segments:
+            st.markdown(f"**Segment {seg.idx}**")
+            src_col, tgt_col = st.columns(2)
+            with src_col:
+                st.text_area("Source", key=f"edit_src_{seg.idx}", height=88, label_visibility="collapsed")
+            with tgt_col:
+                st.text_area("Translation", key=f"edit_tgt_{seg.idx}", height=88, label_visibility="collapsed")
+        save_edits = st.form_submit_button("Save segment edits", use_container_width=True)
+
+    if save_edits:
+        save_segment_edits(base_segments)
+        translated_map = {seg.idx: seg for seg in st.session_state.get("translated_segments", [])}
+
     status_rows = []
     for seg in base_segments:
         translated = translated_map.get(seg.idx)
         seg_status = st.session_state.get("translation_status", {}).get(seg.idx, {})
-        row = {
-            "#": seg.idx,
-            "Status": "✅ Done" if seg_status.get("done") else "❌ Failed" if seg_status.get("error") else "— Pending",
-            "Source text": seg.source_text,
-            "Translated text": translated.translated_text if translated else "",
-        }
-        if show_translate_debug_cols:
-            row["Error"] = seg_status.get("error", "")
-            row["Source chars"] = seg.source_chars
-            row["Target chars"] = translated.translated_chars if translated else 0
-        status_rows.append(row)
+        status_rows.append(
+            {
+                "#": seg.idx,
+                "Status": "✅ Done" if seg_status.get("done") else "❌ Failed" if seg_status.get("error") else "— Pending",
+                "Error": seg_status.get("error", ""),
+                "Source chars": len(st.session_state.get(f"edit_src_{seg.idx}", seg.source_text)),
+                "Target chars": len(st.session_state.get(f"edit_tgt_{seg.idx}", "")),
+            }
+        )
     st.dataframe(status_rows, use_container_width=True)
 
+
+
+
+def save_segment_edits(base_segments: List[Segment]) -> None:
+    existing_map = {seg.idx: seg for seg in st.session_state.get("translated_segments", [])}
+    status_map = st.session_state.get("translation_status", {})
+    updated_segments: List[Segment] = []
+    has_changes = False
+
+    for base_seg in base_segments:
+        src_key = f"edit_src_{base_seg.idx}"
+        tgt_key = f"edit_tgt_{base_seg.idx}"
+        source_text = st.session_state.get(src_key, base_seg.source_text).strip()
+        translated_text = st.session_state.get(tgt_key, "").strip()
+
+        if not source_text:
+            source_text = base_seg.source_text
+            st.session_state[src_key] = source_text
+
+        previous = existing_map.get(base_seg.idx)
+        if previous is None:
+            has_changes = has_changes or bool(translated_text)
+        else:
+            if previous.source_text != source_text or previous.translated_text != translated_text:
+                has_changes = True
+
+        if translated_text:
+            updated_segments.append(
+                Segment(
+                    idx=base_seg.idx,
+                    source_text=source_text,
+                    translated_text=translated_text,
+                    source_audio_filename=previous.source_audio_filename if previous else "",
+                    translated_audio_filename=previous.translated_audio_filename if previous else "",
+                    source_chars=len(source_text),
+                    translated_chars=len(translated_text),
+                )
+            )
+            status_map[base_seg.idx] = {"done": True, "error": ""}
+        else:
+            status_map[base_seg.idx] = {"done": False, "error": "Missing translated text."}
+
+    st.session_state["translated_segments"] = updated_segments
+    st.session_state["translation_status"] = status_map
+
+    all_done = len(updated_segments) == len(base_segments) and not any(s.get("error") for s in status_map.values())
+    st.session_state["translation_fingerprint"] = st.session_state.get("prepared_fingerprint", "") if all_done else ""
+
+    if has_changes:
+        clear_audio_tempdir()
+        st.success("Saved edits. Audio will use the edited source and translated text.")
+    else:
+        st.info("No segment text changes detected.")
 
 def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
     settings = st.session_state["settings"]
