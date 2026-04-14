@@ -913,6 +913,7 @@ def render_prepare_tab(active_api_key: str) -> None:
                 "terminology_map": parse_terminology_map(terminology_map_text),
                 "translation_max_workers": settings.get("translation_max_workers", 2),
             }
+            st.session_state["settings"] = updated
             chars_per_minute = 760
             target_chars = round(updated["target_duration_seconds"] * chars_per_minute / 60)
             target_chars = max(updated["min_segment_chars"], min(target_chars, updated["max_segment_chars"]))
@@ -935,26 +936,38 @@ def render_prepare_tab(active_api_key: str) -> None:
                     )
                 else:
                     target_words = SEGMENT_LENGTH_OPTIONS.get(updated.get("segment_length", "medium"), 50)
-                    try:
-                        client = get_api_client(active_api_key)
-                        segment_texts = segment_text_with_openai(client=client, text=source_text, target_words=target_words)
-                    except Exception as exc:
-                        st.error(
-                            "AI segmentation failed. Falling back to heuristic segmentation. "
-                            f"Details: {exc}"
-                        )
+                    if not active_api_key.strip():
+                        st.warning("No API key detected. Using heuristic segmentation fallback.")
                         segment_texts = cached_segment_text(
                             text=source_text,
                             target_chars=target_chars,
                             min_chars=updated["min_segment_chars"],
                             max_chars=updated["max_segment_chars"],
                         )
+                    else:
+                        try:
+                            client = get_api_client(active_api_key)
+                            segment_texts = segment_text_with_openai(client=client, text=source_text, target_words=target_words)
+                        except Exception as exc:
+                            st.error(
+                                "AI segmentation failed. Falling back to heuristic segmentation. "
+                                f"Details: {exc}"
+                            )
+                        segment_texts = cached_segment_text(
+                            text=source_text,
+                            target_chars=target_chars,
+                            min_chars=updated["min_segment_chars"],
+                            max_chars=updated["max_segment_chars"],
+                        )
+                if source_text.strip() and not segment_texts:
+                    st.warning("No segments were produced. Using the full source text as a single segment.")
+                    segment_texts = [normalize_whitespace(source_text)]
                 st.session_state["base_segments"] = create_segments_from_texts(segment_texts)
                 st.session_state["prepared_fingerprint"] = prepare_fingerprint
                 st.success("Prepared new segments from current settings.")
             else:
                 st.info("Inputs unchanged. Reusing existing prepared segmentation.")
-            st.session_state["settings"] = updated
+            settings = st.session_state["settings"]
 
         chars_per_minute = 760
         target_chars = round(settings["target_duration_seconds"] * chars_per_minute / 60)
