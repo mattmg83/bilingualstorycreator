@@ -260,7 +260,12 @@ def cached_segment_text(text: str, target_chars: int, min_chars: int, max_chars:
     return segment_text(text=text, target_chars=target_chars, min_chars=min_chars, max_chars=max_chars)
 
 
-def segment_text_with_openai(client: OpenAI, text: str, target_words: int) -> List[str]:
+def segment_text_with_openai(
+    client: OpenAI,
+    text: str,
+    target_words: int,
+    request_timeout_seconds: float = 45.0,
+) -> List[str]:
     prompt = (
         "Segment the text into a JSON array of strings.\n"
         "Rules:\n"
@@ -271,7 +276,12 @@ def segment_text_with_openai(client: OpenAI, text: str, target_words: int) -> Li
         "Text:\n"
         f"{text}"
     )
-    response = client.responses.create(model="gpt-5-mini", input=prompt)
+    response = create_response_with_timeout(
+        client=client,
+        model="gpt-5-mini",
+        prompt=prompt,
+        request_timeout_seconds=request_timeout_seconds,
+    )
     raw_text = response.output_text.strip()
     try:
         maybe_array = json.loads(raw_text)
@@ -937,7 +947,16 @@ def render_prepare_tab(active_api_key: str) -> None:
                 else:
                     target_words = SEGMENT_LENGTH_OPTIONS.get(updated.get("segment_length", "medium"), 50)
                     if not active_api_key.strip():
-                        st.warning("No API key detected. Using heuristic segmentation fallback.")
+                        st.warning(
+                            "No API key detected, so AI segmentation is unavailable. "
+                            "Using heuristic segmentation now."
+                        )
+                        st.info(
+                            "To continue, choose one:\n"
+                            "1) Keep heuristic segmentation,\n"
+                            "2) Add `##` markers in your source text for manual segmentation,\n"
+                            "3) Re-enter a valid API key in the sidebar and click **Apply settings & prepare** again."
+                        )
                         segment_texts = cached_segment_text(
                             text=source_text,
                             target_chars=target_chars,
@@ -947,18 +966,26 @@ def render_prepare_tab(active_api_key: str) -> None:
                     else:
                         try:
                             client = get_api_client(active_api_key)
-                            segment_texts = segment_text_with_openai(client=client, text=source_text, target_words=target_words)
+                            segment_texts = segment_text_with_openai(
+                                client=client,
+                                text=source_text,
+                                target_words=target_words,
+                            )
                         except Exception as exc:
                             st.error(
-                                "AI segmentation failed. Falling back to heuristic segmentation. "
-                                f"Details: {exc}"
+                                "AI segmentation failed, so we switched to heuristic segmentation.\n\n"
+                                "Next step: choose one of these options and rerun **Apply settings & prepare**:\n"
+                                "- Keep heuristic segmentation,\n"
+                                "- Add `##` markers for manual segmentation,\n"
+                                "- Re-input your API key in the sidebar."
                             )
-                        segment_texts = cached_segment_text(
-                            text=source_text,
-                            target_chars=target_chars,
-                            min_chars=updated["min_segment_chars"],
-                            max_chars=updated["max_segment_chars"],
-                        )
+                            st.caption(f"Error details: {exc}")
+                            segment_texts = cached_segment_text(
+                                text=source_text,
+                                target_chars=target_chars,
+                                min_chars=updated["min_segment_chars"],
+                                max_chars=updated["max_segment_chars"],
+                            )
                 if source_text.strip() and not segment_texts:
                     st.warning("No segments were produced. Using the full source text as a single segment.")
                     segment_texts = [normalize_whitespace(source_text)]
