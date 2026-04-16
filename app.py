@@ -114,6 +114,7 @@ DEFAULT_SETTINGS = {
     "source_language": "English",
     "target_language": "French",
     "translation_model": "gpt-5-mini",
+    "tts_provider": "openai",
     "tts_model": "gpt-4o-mini-tts",
     "source_voice": "alloy",
     "target_voice": "fable",
@@ -129,6 +130,11 @@ DEFAULT_SETTINGS = {
     "target_instructions": "Use a warm, cheerful, expressive storytelling tone for young children. Keep pacing clear and friendly.",
     "terminology_map": {},
     "translation_max_workers": 2,
+}
+
+TTS_PROVIDERS = {
+    "openai": "OpenAI",
+    "elevenlabs": "ElevenLabs",
 }
 
 SEGMENT_LENGTH_OPTIONS = {
@@ -792,6 +798,7 @@ def get_prepare_fingerprint(settings: dict, target_chars: int) -> str:
 def get_audio_fingerprint(settings: dict, prepare_fingerprint: str) -> str:
     payload = {
         "prepare_fingerprint": prepare_fingerprint,
+        "tts_provider": settings.get("tts_provider", "openai"),
         "tts_model": settings["tts_model"],
         "source_voice": settings["source_voice"],
         "target_voice": settings["target_voice"],
@@ -866,30 +873,39 @@ def render_prepare_tab(active_api_key: str) -> None:
             with st.expander("Generation controls", expanded=False):
                 gc1, gc2 = st.columns(2)
                 with gc1:
+                    tts_provider = st.selectbox(
+                        "TTS provider",
+                        options=list(TTS_PROVIDERS.keys()),
+                        index=list(TTS_PROVIDERS.keys()).index(settings.get("tts_provider", "openai")),
+                        format_func=lambda k: TTS_PROVIDERS[k],
+                    )
+                with gc2:
                     translation_model = st.selectbox(
                         "Translation model",
                         options=list(TRANSLATION_MODELS.keys()),
                         index=list(TRANSLATION_MODELS.keys()).index(settings["translation_model"]),
                         format_func=lambda k: TRANSLATION_MODELS[k]["label"],
                     )
-                with gc2:
+
+                gc3, gc4 = st.columns(2)
+                with gc3:
                     tts_model = st.selectbox(
                         "TTS model",
                         options=list(TTS_MODELS.keys()),
                         index=list(TTS_MODELS.keys()).index(settings["tts_model"]),
                         format_func=lambda k: TTS_MODELS[k]["label"],
                     )
-
-                gc3, gc4 = st.columns(2)
-                with gc3:
-                    source_voice = st.selectbox("Source voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["source_voice"]))
                 with gc4:
-                    target_voice = st.selectbox("Target voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["target_voice"]))
+                    source_voice = st.selectbox("Source voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["source_voice"]))
 
                 gc5, gc6 = st.columns(2)
                 with gc5:
+                    target_voice = st.selectbox("Target voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["target_voice"]))
+
+                gc7, gc8 = st.columns(2)
+                with gc7:
                     speed = st.slider("Speech speed", min_value=0.75, max_value=1.25, value=settings["speed"], step=0.05)
-                with gc6:
+                with gc8:
                     output_format = st.selectbox(
                         "Audio output format", options=["wav", "mp3"], index=["wav", "mp3"].index(settings["output_format"])
                     )
@@ -925,6 +941,7 @@ def render_prepare_tab(active_api_key: str) -> None:
                 "source_language": source_language,
                 "target_language": target_language,
                 "translation_model": translation_model,
+                "tts_provider": tts_provider,
                 "tts_model": tts_model,
                 "source_voice": source_voice,
                 "target_voice": target_voice,
@@ -1044,7 +1061,7 @@ def render_prepare_tab(active_api_key: str) -> None:
             render_cost_panel(live_source_text, settings["translation_model"], settings["tts_model"])
 
 
-def render_translate_tab(api_key: str) -> None:
+def render_translate_tab(openai_api_key: str) -> None:
     settings = st.session_state["settings"]
     st.subheader("Translate")
 
@@ -1057,7 +1074,7 @@ def render_translate_tab(api_key: str) -> None:
     if settings["source_language"] == settings["target_language"]:
         st.error("Choose two different languages in Prepare.")
         return
-    if not api_key.strip():
+    if not openai_api_key.strip():
         st.error("Set OPENAI_API_KEY in Streamlit secrets/environment or enter it in the sidebar.")
         return
 
@@ -1102,7 +1119,7 @@ def render_translate_tab(api_key: str) -> None:
                 progress_bar = st.progress(0.0)
                 status_text = st.empty()
                 try:
-                    client = get_api_client(api_key.strip())
+                    client = get_api_client(openai_api_key.strip())
                     total = len(segments_to_run)
 
                     def on_progress(i: int, run_total: int, seg_idx: int) -> None:
@@ -1250,7 +1267,7 @@ def save_segment_edits(base_segments: List[Segment]) -> None:
     else:
         st.info("No segment text changes detected.")
 
-def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
+def generate_audio_for_indices(openai_api_key: str, indices: List[int]) -> None:
     settings = st.session_state["settings"]
     translated_segments = st.session_state.get("translated_segments", [])
     if not translated_segments:
@@ -1264,7 +1281,7 @@ def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
     segment_map = {seg.idx: seg for seg in translated_segments}
     temp_audio_dir = Path(st.session_state["temp_audio_dir"])
     output_format = settings["output_format"]
-    client = get_api_client(api_key.strip())
+    client = get_api_client(openai_api_key.strip())
     progress = st.progress(0.0)
 
     def generate_one_side(seg_idx: int, side: str, text: str, voice: str, instructions: str) -> dict:
@@ -1407,6 +1424,7 @@ def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
         "source_language": settings["source_language"],
         "target_language": settings["target_language"],
         "translation_model": settings["translation_model"],
+        "tts_provider": settings.get("tts_provider", "openai"),
         "tts_model": settings["tts_model"],
         "source_voice": settings["source_voice"],
         "target_voice": settings["target_voice"],
@@ -1452,7 +1470,7 @@ def generate_audio_for_indices(api_key: str, indices: List[int]) -> None:
     st.success("Audio artifacts ready for export.")
 
 
-def render_audio_tab(api_key: str) -> None:
+def render_audio_tab(openai_api_key: str, elevenlabs_api_key: str) -> None:
     settings = st.session_state["settings"]
     st.subheader("Generate Audio")
 
@@ -1466,8 +1484,19 @@ def render_audio_tab(api_key: str) -> None:
         st.warning("There are translation errors. Retry failed translation segments before generating audio.")
         return
 
-    if not api_key.strip():
-        st.error("Set OPENAI_API_KEY in Streamlit secrets/environment or enter it in the sidebar.")
+    tts_provider = settings.get("tts_provider", "openai")
+    provider_label = TTS_PROVIDERS.get(tts_provider, tts_provider)
+    provider_key = openai_api_key if tts_provider == "openai" else elevenlabs_api_key
+    provider_env_var = "OPENAI_API_KEY" if tts_provider == "openai" else "ELEVENLABS_API_KEY"
+
+    if not provider_key.strip():
+        st.error(f"Set {provider_env_var} in Streamlit secrets/environment or enter it in the sidebar.")
+        return
+    if tts_provider != "openai":
+        st.warning(
+            f"{provider_label} is selected and key validation is ready, but audio generation is still wired to OpenAI TTS models. "
+            "Switch provider to OpenAI in Prepare to generate audio right now."
+        )
         return
 
     current_audio_fp = get_audio_fingerprint(settings, st.session_state["prepared_fingerprint"])
@@ -1484,7 +1513,7 @@ def render_audio_tab(api_key: str) -> None:
         ):
             clear_audio_tempdir()
             indices = [seg.idx for seg in st.session_state["translated_segments"]]
-            generate_audio_for_indices(api_key=api_key, indices=indices)
+            generate_audio_for_indices(openai_api_key=openai_api_key, indices=indices)
     with col_b:
         failed_indices = [
             idx for idx, status in st.session_state.get("audio_status", {}).items() if status.get("error") or not (status.get("source") and status.get("target"))
@@ -1495,7 +1524,7 @@ def render_audio_tab(api_key: str) -> None:
             disabled=not failed_indices,
             key="audio_retry_failed",
         ):
-            generate_audio_for_indices(api_key=api_key, indices=sorted(failed_indices))
+            generate_audio_for_indices(openai_api_key=openai_api_key, indices=sorted(failed_indices))
 
     translated_segments = st.session_state["translated_segments"]
     status_rows = []
@@ -1577,23 +1606,42 @@ def main() -> None:
 
     ensure_state()
 
-    configured_api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+    configured_openai_api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+    configured_elevenlabs_api_key = st.secrets.get("ELEVENLABS_API_KEY") or os.getenv("ELEVENLABS_API_KEY", "")
     with st.sidebar:
-        st.header("OpenAI settings")
-        manual_api_key = st.text_input(
+        st.header("API keys")
+        manual_openai_api_key = st.text_input(
             "OpenAI API key (optional override)",
             type="password",
-            value=st.session_state.get("manual_api_key", ""),
-            help="If provided, this key is used for API calls. If blank, app falls back to secrets/environment key.",
+            value=st.session_state.get("manual_openai_api_key", ""),
+            help="Used for translation, AI segmentation, and OpenAI TTS. If blank, app falls back to secrets/environment key.",
         )
-        st.session_state["manual_api_key"] = manual_api_key
-        api_key = manual_api_key.strip() or configured_api_key
-        if manual_api_key.strip():
-            st.caption("Using API key from sidebar input.")
-        elif configured_api_key:
-            st.caption("Using OPENAI_API_KEY from secrets/environment.")
+        st.session_state["manual_openai_api_key"] = manual_openai_api_key
+        openai_api_key = manual_openai_api_key.strip() or configured_openai_api_key
+        if manual_openai_api_key.strip():
+            st.caption("OpenAI: using API key from sidebar input.")
+        elif configured_openai_api_key:
+            st.caption("OpenAI: using OPENAI_API_KEY from secrets/environment.")
         else:
-            st.caption("No API key set yet.")
+            st.caption("OpenAI: no API key set yet.")
+
+        manual_elevenlabs_api_key = st.text_input(
+            "ElevenLabs API key (optional override)",
+            type="password",
+            value=st.session_state.get("manual_elevenlabs_api_key", ""),
+            help="Used when TTS provider is ElevenLabs. If blank, app falls back to secrets/environment key.",
+        )
+        st.session_state["manual_elevenlabs_api_key"] = manual_elevenlabs_api_key
+        elevenlabs_api_key = manual_elevenlabs_api_key.strip() or configured_elevenlabs_api_key
+        if manual_elevenlabs_api_key.strip():
+            st.caption("ElevenLabs: using API key from sidebar input.")
+        elif configured_elevenlabs_api_key:
+            st.caption("ElevenLabs: using ELEVENLABS_API_KEY from secrets/environment.")
+        else:
+            st.caption("ElevenLabs: no API key set yet.")
+
+        st.divider()
+        st.header("App settings")
         worker_limit = st.slider(
             "Translation parallel workers",
             min_value=1,
@@ -1612,14 +1660,23 @@ def main() -> None:
         if st.button("Start new project", use_container_width=True, key="sidebar_start_new_project"):
             start_new_project()
 
+        st.divider()
+        selected_provider = st.session_state["settings"].get("tts_provider", "openai")
+        selected_label = TTS_PROVIDERS.get(selected_provider, selected_provider)
+        selected_provider_key = openai_api_key if selected_provider == "openai" else elevenlabs_api_key
+        if selected_provider_key.strip():
+            st.success(f"{selected_label} key ready for this session.")
+        else:
+            st.warning(f"{selected_label} key missing for this session.")
+
     tab_prepare, tab_translate, tab_audio, tab_export = st.tabs(["Prepare", "Translate", "Generate Audio", "Export"])
 
     with tab_prepare:
-        render_prepare_tab(active_api_key=api_key)
+        render_prepare_tab(active_api_key=openai_api_key)
     with tab_translate:
-        render_translate_tab(api_key=api_key)
+        render_translate_tab(openai_api_key=openai_api_key)
     with tab_audio:
-        render_audio_tab(api_key=api_key)
+        render_audio_tab(openai_api_key=openai_api_key, elevenlabs_api_key=elevenlabs_api_key)
     with tab_export:
         render_export_tab()
 
