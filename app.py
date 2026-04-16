@@ -1071,8 +1071,7 @@ def render_prepare_tab(active_api_key: str) -> None:
                 )
                 if tts_provider == "elevenlabs" and output_format == "wav":
                     output_format = "mp3"
-                    st.session_state["output_format"] = "mp3"
-                    st.warning("ElevenLabs WAV output is not supported in this app. Switched to MP3 automatically.")
+                    st.warning("ElevenLabs WAV output is not supported in this app. Using MP3 for generation.")
             with gc8:
                 source_first = st.toggle("Source language first in alternating file", value=settings["source_first"], key="source_first")
 
