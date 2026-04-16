@@ -216,6 +216,8 @@ def normalize_tts_settings_for_provider(settings: dict) -> dict:
         normalized["source_voice"] = voices[0]
     if normalized.get("target_voice") not in voices:
         normalized["target_voice"] = voices[min(1, len(voices) - 1)]
+    if provider == "elevenlabs" and normalized.get("output_format") == "wav":
+        normalized["output_format"] = "mp3"
     return normalized
 
 
@@ -1067,6 +1069,10 @@ def render_prepare_tab(active_api_key: str) -> None:
                 output_format = st.selectbox(
                     "Audio output format", options=["wav", "mp3"], index=["wav", "mp3"].index(settings["output_format"]), key="output_format"
                 )
+                if tts_provider == "elevenlabs" and output_format == "wav":
+                    output_format = "mp3"
+                    st.session_state["output_format"] = "mp3"
+                    st.warning("ElevenLabs WAV output is not supported in this app. Switched to MP3 automatically.")
             with gc8:
                 source_first = st.toggle("Source language first in alternating file", value=settings["source_first"], key="source_first")
 
@@ -1482,6 +1488,9 @@ def generate_audio_for_indices(openai_api_key: str, elevenlabs_api_key: str, ind
     temp_audio_dir = Path(st.session_state["temp_audio_dir"])
     output_format = settings["output_format"]
     tts_provider = settings.get("tts_provider", "openai")
+    if tts_provider == "elevenlabs" and output_format == "wav":
+        st.error("Blocked: ElevenLabs WAV output is unsupported in this app. Use MP3.")
+        return
     client = get_api_client(openai_api_key.strip()) if tts_provider == "openai" else None
     progress = st.progress(0.0)
 
