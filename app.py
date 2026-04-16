@@ -10,6 +10,8 @@ import re
 import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 import wave
 import zipfile
 from dataclasses import asdict, dataclass
@@ -59,7 +61,7 @@ TRANSLATION_MODELS: Dict[str, Dict[str, float | str]] = {
     },
 }
 
-TTS_MODELS: Dict[str, Dict[str, float | str | bool]] = {
+OPENAI_TTS_MODELS: Dict[str, Dict[str, float | str | bool]] = {
     "gpt-4o-mini-tts": {
         "label": "GPT-4o mini TTS",
         "text_input_per_mtok": 0.60,
@@ -81,7 +83,7 @@ TTS_MODELS: Dict[str, Dict[str, float | str | bool]] = {
     },
 }
 
-VOICE_OPTIONS = [
+OPENAI_VOICE_OPTIONS = [
     "alloy",
     "ash",
     "ballad",
@@ -137,6 +139,32 @@ TTS_PROVIDERS = {
     "elevenlabs": "ElevenLabs",
 }
 
+ELEVENLABS_TTS_MODELS: Dict[str, Dict[str, float | str | bool]] = {
+    "eleven_multilingual_v2": {
+        "label": "Eleven Multilingual v2",
+        "per_mchar": 0.0,
+        "supports_instructions": False,
+        "notes": "Fast, high quality. Cost estimate not available in this app.",
+    },
+    "eleven_flash_v2_5": {
+        "label": "Eleven Flash v2.5",
+        "per_mchar": 0.0,
+        "supports_instructions": False,
+        "notes": "Lower latency. Cost estimate not available in this app.",
+    },
+}
+
+ELEVENLABS_VOICE_OPTIONS = [
+    "EXAVITQu4vr4xnSDxMaL",  # Sarah
+    "ErXwobaYiN019PkySvjV",  # Antoni
+    "MF3mGyEYCl7XYWbV9V6O",  # Elli
+]
+
+TTS_CONFIG_BY_PROVIDER: Dict[str, Dict[str, object]] = {
+    "openai": {"models": OPENAI_TTS_MODELS, "voices": OPENAI_VOICE_OPTIONS},
+    "elevenlabs": {"models": ELEVENLABS_TTS_MODELS, "voices": ELEVENLABS_VOICE_OPTIONS},
+}
+
 SEGMENT_LENGTH_OPTIONS = {
     "short": 25,
     "medium": 50,
@@ -164,6 +192,31 @@ class CostLine:
     estimated_tts_cost: float
     estimated_total_cost: float
     notes: str
+
+
+def get_tts_models(provider: str) -> Dict[str, Dict[str, float | str | bool]]:
+    provider_config = TTS_CONFIG_BY_PROVIDER.get(provider, TTS_CONFIG_BY_PROVIDER["openai"])
+    return provider_config["models"]  # type: ignore[return-value]
+
+
+def get_tts_voices(provider: str) -> List[str]:
+    provider_config = TTS_CONFIG_BY_PROVIDER.get(provider, TTS_CONFIG_BY_PROVIDER["openai"])
+    return provider_config["voices"]  # type: ignore[return-value]
+
+
+def normalize_tts_settings_for_provider(settings: dict) -> dict:
+    normalized = settings.copy()
+    provider = normalized.get("tts_provider", "openai")
+    models = get_tts_models(provider)
+    voices = get_tts_voices(provider)
+
+    if normalized.get("tts_model") not in models:
+        normalized["tts_model"] = next(iter(models.keys()))
+    if normalized.get("source_voice") not in voices:
+        normalized["source_voice"] = voices[0]
+    if normalized.get("target_voice") not in voices:
+        normalized["target_voice"] = voices[min(1, len(voices) - 1)]
+    return normalized
 
 
 def estimate_tokens_from_chars(text: str) -> int:
@@ -438,7 +491,7 @@ def write_wav_bytes(response) -> bytes:
     raise TypeError("Unsupported audio response type from OpenAI SDK")
 
 
-def tts_segment(
+def openai_tts_segment(
     client: OpenAI,
     text: str,
     model: str,
@@ -454,10 +507,98 @@ def tts_segment(
         "response_format": response_format,
         "speed": speed,
     }
-    if TTS_MODELS[model].get("supports_instructions") and instructions.strip():
+    if OPENAI_TTS_MODELS[model].get("supports_instructions") and instructions.strip():
         kwargs["instructions"] = instructions.strip()
     response = client.audio.speech.create(**kwargs)
     return write_wav_bytes(response)
+
+
+def pcm16le_to_wav_bytes(pcm_audio: bytes, sample_rate: int = 44100) -> bytes:
+    out_io = io.BytesIO()
+    with wave.open(out_io, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm_audio)
+    return out_io.getvalue()
+
+
+def elevenlabs_tts_segment(
+    api_key: str,
+    text: str,
+    model: str,
+    voice: str,
+    response_format: str,
+) -> bytes:
+    if response_format not in {"wav", "mp3"}:
+        raise ValueError(f"ElevenLabs does not support output format '{response_format}'. Use wav or mp3.")
+
+    output_format = "pcm_44100" if response_format == "wav" else "mp3_44100_128"
+    endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{voice}?output_format={output_format}"
+    payload = json.dumps({"text": text, "model_id": model}).encode("utf-8")
+    request = Request(
+        endpoint,
+        data=payload,
+        headers={
+            "xi-api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg" if response_format == "mp3" else "audio/wav",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=90) as response:
+            audio_blob = response.read()
+    except HTTPError as exc:
+        try:
+            raw_body = exc.read().decode("utf-8")
+            detail = json.loads(raw_body).get("detail", raw_body)
+        except Exception:
+            detail = exc.reason or f"HTTP {exc.code}"
+        raise RuntimeError(f"ElevenLabs request failed ({exc.code}): {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"ElevenLabs request failed: {exc.reason}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"ElevenLabs request failed: {exc}") from exc
+
+    if response_format == "wav":
+        return pcm16le_to_wav_bytes(audio_blob, sample_rate=44100)
+    return audio_blob
+
+
+def synthesize_tts_segment(
+    provider: str,
+    text: str,
+    model: str,
+    voice: str,
+    instructions: str,
+    speed: float,
+    response_format: str,
+    openai_client: OpenAI | None = None,
+    elevenlabs_api_key: str = "",
+) -> bytes:
+    if provider == "elevenlabs":
+        if not elevenlabs_api_key.strip():
+            raise RuntimeError("Missing ElevenLabs API key.")
+        return elevenlabs_tts_segment(
+            api_key=elevenlabs_api_key.strip(),
+            text=text,
+            model=model,
+            voice=voice,
+            response_format=response_format,
+        )
+
+    if openai_client is None:
+        raise RuntimeError("Missing OpenAI client for TTS synthesis.")
+    return openai_tts_segment(
+        client=openai_client,
+        text=text,
+        model=model,
+        voice=voice,
+        instructions=instructions,
+        speed=speed,
+        response_format=response_format,
+    )
 
 
 def concat_wav_bytes(parts: List[bytes]) -> bytes:
@@ -568,17 +709,20 @@ def filter_compatible_wav_soundfx(soundfx_files: List[Path], reference_wav: byte
     return compatible, skipped
 
 
-def estimate_tts_cost(model: str, text_a: str, text_b: str) -> float:
+def estimate_tts_cost(provider: str, model: str, text_a: str, text_b: str) -> float:
     total_text = text_a + text_b
-    if model in {"tts-1", "tts-1-hd"}:
-        per_mchar = float(TTS_MODELS[model]["per_mchar"])
+    models = get_tts_models(provider)
+    if model not in models:
+        return 0.0
+    if "per_mchar" in models[model]:
+        per_mchar = float(models[model]["per_mchar"])
         return (len(total_text) / 1_000_000) * per_mchar
 
     text_tokens = estimate_tokens_from_chars(total_text)
     est_minutes = estimate_minutes_from_chars(total_text)
     audio_tokens = est_minutes * 1200
-    text_input = (text_tokens / 1_000_000) * float(TTS_MODELS[model]["text_input_per_mtok"])
-    audio_output = (audio_tokens / 1_000_000) * float(TTS_MODELS[model]["audio_output_per_mtok"])
+    text_input = (text_tokens / 1_000_000) * float(models[model]["text_input_per_mtok"])
+    audio_output = (audio_tokens / 1_000_000) * float(models[model]["audio_output_per_mtok"])
     return text_input + audio_output
 
 
@@ -592,14 +736,14 @@ def estimate_translation_cost(model: str, source_text: str, target_language_mult
 
 
 @st.cache_data(ttl=3600, max_entries=128)
-def cached_comparison_table(source_text: str, translated_multiplier: float = 1.1) -> List[dict]:
+def cached_comparison_table(source_text: str, tts_provider: str, translated_multiplier: float = 1.1) -> List[dict]:
     rows: List[CostLine] = []
     for t_model, t_meta in TRANSLATION_MODELS.items():
-        for v_model, v_meta in TTS_MODELS.items():
+        for v_model, v_meta in get_tts_models(tts_provider).items():
             translation_cost = estimate_translation_cost(t_model, source_text, translated_multiplier)
             approx_translated_chars = math.ceil(len(source_text) * translated_multiplier)
             proxy_translated_text = "x" * approx_translated_chars
-            tts_cost = estimate_tts_cost(v_model, source_text, proxy_translated_text)
+            tts_cost = estimate_tts_cost(tts_provider, v_model, source_text, proxy_translated_text)
             rows.append(
                 CostLine(
                     model=f"{t_meta['label']} + {v_meta['label']}",
@@ -629,10 +773,11 @@ def make_fingerprint(payload: dict) -> str:
 
 def ensure_state() -> None:
     if "settings" not in st.session_state:
-        st.session_state["settings"] = DEFAULT_SETTINGS.copy()
+        st.session_state["settings"] = normalize_tts_settings_for_provider(DEFAULT_SETTINGS.copy())
     else:
         for key, value in DEFAULT_SETTINGS.items():
             st.session_state["settings"].setdefault(key, value)
+        st.session_state["settings"] = normalize_tts_settings_for_provider(st.session_state["settings"])
     if "draft_source_text" not in st.session_state:
         st.session_state["draft_source_text"] = st.session_state["settings"]["source_text"]
     if "base_segments" not in st.session_state:
@@ -681,7 +826,7 @@ def start_new_project() -> None:
     keys_to_remove = [k for k in st.session_state.keys() if k.startswith("edit_src_") or k.startswith("edit_tgt_")]
     for key in keys_to_remove:
         del st.session_state[key]
-    st.session_state["settings"] = DEFAULT_SETTINGS.copy()
+    st.session_state["settings"] = normalize_tts_settings_for_provider(DEFAULT_SETTINGS.copy())
     st.session_state["draft_source_text"] = ""
     st.session_state["base_segments"] = []
     st.session_state["prepared_fingerprint"] = ""
@@ -701,13 +846,14 @@ def get_api_client(api_key: str) -> OpenAI:
     return st.session_state["api_client"]
 
 
-def render_cost_panel(source_text: str, selected_translation_model: str, selected_tts_model: str) -> None:
+def render_cost_panel(source_text: str, selected_translation_model: str, selected_tts_provider: str, selected_tts_model: str) -> None:
     if not source_text.strip():
         st.info("Enter text to see estimated cost comparisons.")
         return
 
-    rows = cached_comparison_table(source_text)
+    rows = cached_comparison_table(source_text, selected_tts_provider)
     selected_total = estimate_translation_cost(selected_translation_model, source_text) + estimate_tts_cost(
+        selected_tts_provider,
         selected_tts_model,
         source_text,
         "x" * math.ceil(len(source_text) * 1.1),
@@ -888,19 +1034,36 @@ def render_prepare_tab(active_api_key: str) -> None:
                     )
 
                 gc3, gc4 = st.columns(2)
+                provider_models = get_tts_models(tts_provider)
+                provider_voices = get_tts_voices(tts_provider)
+                selected_model = settings["tts_model"] if settings["tts_model"] in provider_models else next(iter(provider_models.keys()))
+                selected_source_voice = (
+                    settings["source_voice"] if settings["source_voice"] in provider_voices else provider_voices[0]
+                )
+                selected_target_voice = (
+                    settings["target_voice"] if settings["target_voice"] in provider_voices else provider_voices[min(1, len(provider_voices) - 1)]
+                )
                 with gc3:
                     tts_model = st.selectbox(
                         "TTS model",
-                        options=list(TTS_MODELS.keys()),
-                        index=list(TTS_MODELS.keys()).index(settings["tts_model"]),
-                        format_func=lambda k: TTS_MODELS[k]["label"],
+                        options=list(provider_models.keys()),
+                        index=list(provider_models.keys()).index(selected_model),
+                        format_func=lambda k: provider_models[k]["label"],
                     )
                 with gc4:
-                    source_voice = st.selectbox("Source voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["source_voice"]))
+                    source_voice = st.selectbox(
+                        "Source voice",
+                        provider_voices,
+                        index=provider_voices.index(selected_source_voice),
+                    )
 
                 gc5, gc6 = st.columns(2)
                 with gc5:
-                    target_voice = st.selectbox("Target voice", VOICE_OPTIONS, index=VOICE_OPTIONS.index(settings["target_voice"]))
+                    target_voice = st.selectbox(
+                        "Target voice",
+                        provider_voices,
+                        index=provider_voices.index(selected_target_voice),
+                    )
 
                 gc7, gc8 = st.columns(2)
                 with gc7:
@@ -958,6 +1121,7 @@ def render_prepare_tab(active_api_key: str) -> None:
                 "terminology_map": parse_terminology_map(terminology_map_text),
                 "translation_max_workers": settings.get("translation_max_workers", 2),
             }
+            updated = normalize_tts_settings_for_provider(updated)
             st.session_state["settings"] = updated
             chars_per_minute = 760
             target_chars = round(updated["target_duration_seconds"] * chars_per_minute / 60)
@@ -1058,7 +1222,12 @@ def render_prepare_tab(active_api_key: str) -> None:
         st.caption("Updates live as you type; final pipeline still uses prepared settings.")
         live_source_text = st.session_state.get("draft_source_text", settings["source_text"])
         with st.expander("Cost estimation", expanded=False):
-            render_cost_panel(live_source_text, settings["translation_model"], settings["tts_model"])
+            render_cost_panel(
+                live_source_text,
+                settings["translation_model"],
+                settings.get("tts_provider", "openai"),
+                settings["tts_model"],
+            )
 
 
 def render_translate_tab(openai_api_key: str) -> None:
@@ -1267,7 +1436,7 @@ def save_segment_edits(base_segments: List[Segment]) -> None:
     else:
         st.info("No segment text changes detected.")
 
-def generate_audio_for_indices(openai_api_key: str, indices: List[int]) -> None:
+def generate_audio_for_indices(openai_api_key: str, elevenlabs_api_key: str, indices: List[int]) -> None:
     settings = st.session_state["settings"]
     translated_segments = st.session_state.get("translated_segments", [])
     if not translated_segments:
@@ -1281,18 +1450,21 @@ def generate_audio_for_indices(openai_api_key: str, indices: List[int]) -> None:
     segment_map = {seg.idx: seg for seg in translated_segments}
     temp_audio_dir = Path(st.session_state["temp_audio_dir"])
     output_format = settings["output_format"]
-    client = get_api_client(openai_api_key.strip())
+    tts_provider = settings.get("tts_provider", "openai")
+    client = get_api_client(openai_api_key.strip()) if tts_provider == "openai" else None
     progress = st.progress(0.0)
 
     def generate_one_side(seg_idx: int, side: str, text: str, voice: str, instructions: str) -> dict:
-        blob = tts_segment(
-            client=client,
+        blob = synthesize_tts_segment(
+            provider=tts_provider,
             text=text,
             model=settings["tts_model"],
             voice=voice,
             instructions=instructions,
             speed=settings["speed"],
             response_format=output_format,
+            openai_client=client,
+            elevenlabs_api_key=elevenlabs_api_key,
         )
         file_path = temp_audio_dir / f"{side}_{seg_idx:03d}.{output_format}"
         file_path.write_bytes(blob)
@@ -1345,8 +1517,9 @@ def generate_audio_for_indices(openai_api_key: str, indices: List[int]) -> None:
                             seg_status["error"] = ""
                     except Exception as exc:
                         had_failure = True
-                        seg_status["error"] = str(exc)
-                        st.error(f"Segment {seg_idx} {side} failed: {exc}")
+                        normalized_message = f"Segment {seg_idx} {side} failed: {exc}"
+                        seg_status["error"] = normalized_message
+                        st.error(normalized_message)
 
                     completed += 1
                     progress.progress(completed / total_steps)
@@ -1452,6 +1625,7 @@ def generate_audio_for_indices(openai_api_key: str, indices: List[int]) -> None:
             "translation": round(estimate_translation_cost(settings["translation_model"], settings["source_text"]), 6),
             "tts": round(
                 estimate_tts_cost(
+                    settings.get("tts_provider", "openai"),
                     settings["tts_model"],
                     settings["source_text"],
                     " ".join(s.translated_text for s in translated_segments),
@@ -1492,13 +1666,6 @@ def render_audio_tab(openai_api_key: str, elevenlabs_api_key: str) -> None:
     if not provider_key.strip():
         st.error(f"Set {provider_env_var} in Streamlit secrets/environment or enter it in the sidebar.")
         return
-    if tts_provider != "openai":
-        st.warning(
-            f"{provider_label} is selected and key validation is ready, but audio generation is still wired to OpenAI TTS models. "
-            "Switch provider to OpenAI in Prepare to generate audio right now."
-        )
-        return
-
     current_audio_fp = get_audio_fingerprint(settings, st.session_state["prepared_fingerprint"])
     if st.session_state.get("audio_generation_fingerprint") == current_audio_fp and st.session_state.get("artifacts"):
         st.info("Audio already matches current inputs. Reusing existing artifacts.")
@@ -1513,7 +1680,11 @@ def render_audio_tab(openai_api_key: str, elevenlabs_api_key: str) -> None:
         ):
             clear_audio_tempdir()
             indices = [seg.idx for seg in st.session_state["translated_segments"]]
-            generate_audio_for_indices(openai_api_key=openai_api_key, indices=indices)
+            generate_audio_for_indices(
+                openai_api_key=openai_api_key,
+                elevenlabs_api_key=elevenlabs_api_key,
+                indices=indices,
+            )
     with col_b:
         failed_indices = [
             idx for idx, status in st.session_state.get("audio_status", {}).items() if status.get("error") or not (status.get("source") and status.get("target"))
@@ -1524,7 +1695,11 @@ def render_audio_tab(openai_api_key: str, elevenlabs_api_key: str) -> None:
             disabled=not failed_indices,
             key="audio_retry_failed",
         ):
-            generate_audio_for_indices(openai_api_key=openai_api_key, indices=sorted(failed_indices))
+            generate_audio_for_indices(
+                openai_api_key=openai_api_key,
+                elevenlabs_api_key=elevenlabs_api_key,
+                indices=sorted(failed_indices),
+            )
 
     translated_segments = st.session_state["translated_segments"]
     status_rows = []
