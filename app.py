@@ -994,6 +994,102 @@ def render_prepare_tab(active_api_key: str) -> None:
             "If `##` is not present, AI segmentation is used (with automatic fallback if needed)."
         )
 
+        with st.expander("Generation controls", expanded=False):
+            gc1, gc2 = st.columns(2)
+            with gc1:
+                current_provider = st.session_state.get("tts_provider", settings.get("tts_provider", "openai"))
+                if current_provider not in TTS_PROVIDERS:
+                    current_provider = "openai"
+                tts_provider = st.selectbox(
+                    "TTS provider",
+                    options=list(TTS_PROVIDERS.keys()),
+                    index=list(TTS_PROVIDERS.keys()).index(current_provider),
+                    format_func=lambda k: TTS_PROVIDERS[k],
+                    key="tts_provider",
+                )
+                st.caption("Model/voice lists follow selected provider.")
+            with gc2:
+                current_translation_model = st.session_state.get(
+                    "translation_model", settings.get("translation_model", "gpt-5-mini")
+                )
+                if current_translation_model not in TRANSLATION_MODELS:
+                    current_translation_model = "gpt-5-mini"
+                translation_model = st.selectbox(
+                    "Translation model",
+                    options=list(TRANSLATION_MODELS.keys()),
+                    index=list(TRANSLATION_MODELS.keys()).index(current_translation_model),
+                    format_func=lambda k: TRANSLATION_MODELS[k]["label"],
+                    key="translation_model",
+                )
+
+            provider_models = get_tts_models(tts_provider)
+            provider_voices = get_tts_voices(tts_provider)
+
+            gc3, gc4 = st.columns(2)
+            with gc3:
+                current_tts_model = st.session_state.get("tts_model", settings.get("tts_model"))
+                if current_tts_model not in provider_models:
+                    current_tts_model = next(iter(provider_models.keys()))
+                tts_model = st.selectbox(
+                    "TTS model",
+                    options=list(provider_models.keys()),
+                    index=list(provider_models.keys()).index(current_tts_model),
+                    format_func=lambda k: provider_models[k]["label"],
+                    key="tts_model",
+                )
+            with gc4:
+                current_source_voice = st.session_state.get("source_voice", settings.get("source_voice"))
+                if current_source_voice not in provider_voices:
+                    current_source_voice = provider_voices[0]
+                source_voice = st.selectbox(
+                    "Source voice",
+                    provider_voices,
+                    index=provider_voices.index(current_source_voice),
+                    key="source_voice",
+                )
+
+            gc5, gc6 = st.columns(2)
+            with gc5:
+                current_target_voice = st.session_state.get("target_voice", settings.get("target_voice"))
+                if current_target_voice not in provider_voices:
+                    current_target_voice = provider_voices[min(1, len(provider_voices) - 1)]
+                target_voice = st.selectbox(
+                    "Target voice",
+                    provider_voices,
+                    index=provider_voices.index(current_target_voice),
+                    key="target_voice",
+                )
+            with gc6:
+                speed = st.slider("Speech speed", min_value=0.75, max_value=1.25, value=settings["speed"], step=0.05, key="speed")
+
+            gc7, gc8 = st.columns(2)
+            with gc7:
+                output_format = st.selectbox(
+                    "Audio output format", options=["wav", "mp3"], index=["wav", "mp3"].index(settings["output_format"]), key="output_format"
+                )
+            with gc8:
+                source_first = st.toggle("Source language first in alternating file", value=settings["source_first"], key="source_first")
+
+            output_basename = st.text_input(
+                "Output audio base name",
+                value=settings["output_basename"],
+                help="Used for exported full audio downloads (example: lesson_01).",
+                key="output_basename",
+            )
+            source_instructions = st.text_input(
+                "Source voice instructions (only for GPT-4o mini TTS)", value=settings["source_instructions"], key="source_instructions"
+            )
+            target_instructions = st.text_input(
+                "Target voice instructions (only for GPT-4o mini TTS)", value=settings["target_instructions"], key="target_instructions"
+            )
+            terminology_map_text = st.text_area(
+                "Preferred terms (source=target per line)",
+                value=terminology_map_to_text(settings.get("terminology_map")),
+                height=120,
+                help="Optional glossary. Malformed lines are ignored.",
+                key="terminology_map_text",
+            )
+
         with st.form("main_controls_form"):
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -1021,84 +1117,6 @@ def render_prepare_tab(active_api_key: str) -> None:
                 index=list(SEGMENT_LENGTH_OPTIONS.keys()).index(settings.get("segment_length", "medium")),
                 help="Used by AI segmentation when no manual `##` markers are present.",
             )
-
-            st.divider()
-            with st.expander("Generation controls", expanded=False):
-                gc1, gc2 = st.columns(2)
-                with gc1:
-                    tts_provider = st.selectbox(
-                        "TTS provider",
-                        options=list(TTS_PROVIDERS.keys()),
-                        index=list(TTS_PROVIDERS.keys()).index(settings.get("tts_provider", "openai")),
-                        format_func=lambda k: TTS_PROVIDERS[k],
-                    )
-                with gc2:
-                    translation_model = st.selectbox(
-                        "Translation model",
-                        options=list(TRANSLATION_MODELS.keys()),
-                        index=list(TRANSLATION_MODELS.keys()).index(settings["translation_model"]),
-                        format_func=lambda k: TRANSLATION_MODELS[k]["label"],
-                    )
-
-                gc3, gc4 = st.columns(2)
-                provider_models = get_tts_models(tts_provider)
-                provider_voices = get_tts_voices(tts_provider)
-                selected_model = settings["tts_model"] if settings["tts_model"] in provider_models else next(iter(provider_models.keys()))
-                selected_source_voice = (
-                    settings["source_voice"] if settings["source_voice"] in provider_voices else provider_voices[0]
-                )
-                selected_target_voice = (
-                    settings["target_voice"] if settings["target_voice"] in provider_voices else provider_voices[min(1, len(provider_voices) - 1)]
-                )
-                with gc3:
-                    tts_model = st.selectbox(
-                        "TTS model",
-                        options=list(provider_models.keys()),
-                        index=list(provider_models.keys()).index(selected_model),
-                        format_func=lambda k: provider_models[k]["label"],
-                    )
-                with gc4:
-                    source_voice = st.selectbox(
-                        "Source voice",
-                        provider_voices,
-                        index=provider_voices.index(selected_source_voice),
-                    )
-
-                gc5, gc6 = st.columns(2)
-                with gc5:
-                    target_voice = st.selectbox(
-                        "Target voice",
-                        provider_voices,
-                        index=provider_voices.index(selected_target_voice),
-                    )
-
-                gc7, gc8 = st.columns(2)
-                with gc7:
-                    speed = st.slider("Speech speed", min_value=0.75, max_value=1.25, value=settings["speed"], step=0.05)
-                with gc8:
-                    output_format = st.selectbox(
-                        "Audio output format", options=["wav", "mp3"], index=["wav", "mp3"].index(settings["output_format"])
-                    )
-
-                output_basename = st.text_input(
-                    "Output audio base name",
-                    value=settings["output_basename"],
-                    help="Used for exported full audio downloads (example: lesson_01).",
-                )
-                source_first = st.toggle("Source language first in alternating file", value=settings["source_first"])
-
-                source_instructions = st.text_input(
-                    "Source voice instructions (only for GPT-4o mini TTS)", value=settings["source_instructions"]
-                )
-                target_instructions = st.text_input(
-                    "Target voice instructions (only for GPT-4o mini TTS)", value=settings["target_instructions"]
-                )
-                terminology_map_text = st.text_area(
-                    "Preferred terms (source=target per line)",
-                    value=terminology_map_to_text(settings.get("terminology_map")),
-                    height=120,
-                    help="Optional glossary. Malformed lines are ignored.",
-                )
             submitted = st.form_submit_button("Apply settings & prepare", type="primary", use_container_width=True)
 
         if submitted:
