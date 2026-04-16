@@ -851,6 +851,14 @@ def render_cost_panel(source_text: str, selected_translation_model: str, selecte
         st.info("Enter text to see estimated cost comparisons.")
         return
 
+    st.subheader("Estimated cost")
+    if selected_tts_provider != "openai":
+        translation_only = estimate_translation_cost(selected_translation_model, source_text)
+        st.metric("Estimated translation cost (current selection)", f"${translation_only:.4f}")
+        st.info("ElevenLabs TTS cost is not estimated in this app yet. Add pricing constants to enable it.")
+        st.caption("Total estimate is intentionally hidden for ElevenLabs until TTS pricing is configured.")
+        return
+
     rows = cached_comparison_table(source_text, selected_tts_provider)
     selected_total = estimate_translation_cost(selected_translation_model, source_text) + estimate_tts_cost(
         selected_tts_provider,
@@ -858,8 +866,6 @@ def render_cost_panel(source_text: str, selected_translation_model: str, selecte
         source_text,
         "x" * math.ceil(len(source_text) * 1.1),
     )
-
-    st.subheader("Estimated cost")
     st.metric("Estimated cost for current selection", f"${selected_total:.4f}")
     st.caption(
         "This is an estimate, not a bill. Translation token usage is approximated from character count, and "
@@ -942,9 +948,10 @@ def get_prepare_fingerprint(settings: dict, target_chars: int) -> str:
 
 
 def get_audio_fingerprint(settings: dict, prepare_fingerprint: str) -> str:
+    tts_provider = settings.get("tts_provider", "openai")
     payload = {
         "prepare_fingerprint": prepare_fingerprint,
-        "tts_provider": settings.get("tts_provider", "openai"),
+        "tts_provider": tts_provider,
         "tts_model": settings["tts_model"],
         "source_voice": settings["source_voice"],
         "target_voice": settings["target_voice"],
@@ -1444,6 +1451,12 @@ def generate_audio_for_indices(openai_api_key: str, elevenlabs_api_key: str, ind
         return
 
     audio_fp = get_audio_fingerprint(settings, st.session_state["prepared_fingerprint"])
+    previous_audio_fp = st.session_state.get("audio_generation_fingerprint", "")
+    if previous_audio_fp and previous_audio_fp != audio_fp:
+        clear_audio_tempdir()
+        if not st.session_state.get("temp_audio_dir"):
+            st.session_state["temp_audio_dir"] = tempfile.mkdtemp(prefix="bilingual_audio_")
+        st.info("Audio settings changed (including provider). Cleared stale audio cache before regeneration.")
     if not st.session_state.get("temp_audio_dir"):
         st.session_state["temp_audio_dir"] = tempfile.mkdtemp(prefix="bilingual_audio_")
 
@@ -1592,8 +1605,31 @@ def generate_audio_for_indices(openai_api_key: str, elevenlabs_api_key: str, ind
         artifacts[seg.source_audio_filename] = Path(source_path).read_bytes()
         artifacts[seg.translated_audio_filename] = Path(target_path).read_bytes()
 
+    estimated_translation_cost = round(estimate_translation_cost(settings["translation_model"], settings["source_text"]), 6)
+    estimated_tts_cost_value: float | None = round(
+        estimate_tts_cost(
+            settings.get("tts_provider", "openai"),
+            settings["tts_model"],
+            settings["source_text"],
+            " ".join(s.translated_text for s in translated_segments),
+        ),
+        6,
+    )
+    if settings.get("tts_provider", "openai") != "openai":
+        estimated_tts_cost_value = None
+
     manifest = {
         "pipeline": "text_only_bilingual_recomposer",
+        "providers": {
+            "translation": {
+                "provider": "openai",
+                "model": settings["translation_model"],
+            },
+            "tts": {
+                "provider": settings.get("tts_provider", "openai"),
+                "model": settings["tts_model"],
+            },
+        },
         "source_language": settings["source_language"],
         "target_language": settings["target_language"],
         "translation_model": settings["translation_model"],
@@ -1622,21 +1658,15 @@ def generate_audio_for_indices(openai_api_key: str, elevenlabs_api_key: str, ind
         },
         "segments": [asdict(s) for s in translated_segments],
         "estimated_cost_usd": {
-            "translation": round(estimate_translation_cost(settings["translation_model"], settings["source_text"]), 6),
-            "tts": round(
-                estimate_tts_cost(
-                    settings.get("tts_provider", "openai"),
-                    settings["tts_model"],
-                    settings["source_text"],
-                    " ".join(s.translated_text for s in translated_segments),
-                ),
-                6,
-            ),
+            "translation": estimated_translation_cost,
+            "tts": estimated_tts_cost_value,
         },
     }
-    manifest["estimated_cost_usd"]["total"] = round(
-        manifest["estimated_cost_usd"]["translation"] + manifest["estimated_cost_usd"]["tts"], 6
-    )
+    if estimated_tts_cost_value is None:
+        manifest["estimated_cost_usd"]["total"] = None
+        manifest["estimated_cost_usd"]["notes"] = "TTS estimate is not available for ElevenLabs in this build."
+    else:
+        manifest["estimated_cost_usd"]["total"] = round(estimated_translation_cost + estimated_tts_cost_value, 6)
 
     st.session_state["artifacts"] = artifacts
     st.session_state["manifest"] = manifest

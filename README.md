@@ -62,12 +62,13 @@ The app inserts transition SFX in the **alternating** output when matching files
 
 ## Deploy (recommended): Streamlit Community Cloud
 
-### Required secret
+### Required secrets
 
 Add this in Streamlit app settings → **Secrets**:
 
 ```toml
 OPENAI_API_KEY = "your_openai_api_key"
+ELEVENLABS_API_KEY = "your_elevenlabs_api_key" # required only when TTS provider is ElevenLabs
 ```
 
 > The app supports manual API key entry in the sidebar for local testing, but hosted deploys should use secrets.
@@ -82,6 +83,7 @@ OPENAI_API_KEY = "your_openai_api_key"
 
    ```toml
    OPENAI_API_KEY = "your_openai_api_key"
+   ELEVENLABS_API_KEY = "your_elevenlabs_api_key" # only needed for ElevenLabs TTS
    ```
 6. Deploy.
 
@@ -97,8 +99,8 @@ streamlit run app.py
 ## Local dev vs hosted
 
 - **API key source**
-  - Local: usually typed into sidebar (or set `OPENAI_API_KEY` env var).
-  - Hosted: should come from Streamlit Secrets (`OPENAI_API_KEY`).
+  - Local: usually typed into sidebar (or set `OPENAI_API_KEY` / `ELEVENLABS_API_KEY` env vars).
+  - Hosted: should come from Streamlit Secrets (`OPENAI_API_KEY`; add `ELEVENLABS_API_KEY` if using ElevenLabs TTS).
 
 - **Networking**
   - Local: uses your machine defaults.
@@ -111,8 +113,11 @@ streamlit run app.py
 ## Notes
 
 - Cost numbers are estimates, not billing records.
+- OpenAI TTS has built-in cost estimates in the app.
+- ElevenLabs TTS intentionally shows **not estimated** in the cost panel until pricing constants are added.
 - Speech input is segmented before TTS to stay within endpoint limits.
 - Translation is segment-by-segment for simplicity.
+- Audio reuse safety: cache/artifact fingerprints include the TTS provider, so switching OpenAI ↔ ElevenLabs forces fresh audio generation.
 
 ## Manual segmentation with `##`
 
